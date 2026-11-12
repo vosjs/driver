@@ -1,0 +1,121 @@
+# The release flow.
+#
+# A release is a tag. Pushing `v<version>` builds the helper on a Mac, runs the
+# whole gate, packs both packages, and publishes them to npm through OIDC trusted
+# publishing (id-token: write; there is no NPM_TOKEN and there must never be one).
+#
+# The tag must name the version the tree says (the two packages and the Swift
+# source agree on one), and its commit must be on main: scripts/check-release.mjs.
+# The steps are in the README, under Release.
+#
+# The build and the publish are TWO JOBS, because the OIDC token is minted for a
+# job and every line that runs in that job can ask for it. The build job holds a
+# read-only token: it installs, compiles, tests and packs. The publish job alone
+# holds id-token: it checks out nothing and installs nothing but npm, takes the
+# two tarballs the build job made, and publishes them. Nothing a dependency or a
+# test ships ever runs beside the credential.
+#
+# Run by hand (workflow_dispatch) it is a REHEARSAL: the same build, then both
+# publishes with --dry-run. A rehearsal never publishes.
+#
+# Every action is pinned to a commit, with its version beside it; Dependabot
+# moves the pins (.github/dependabot.yml).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# One release at a time, and never a half-finished one cancelled by the next.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Nothing by default; each job names what it holds.
+permissions: {}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history: the release check asks whether this commit is on main.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # What is being released, and whether it may be: before anything is built.
+      - name: Check the release
+        id: release
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: node scripts/check-release.mjs
+      - run: pnpm check
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+      # Packs both packages as they are published, and installs them into fresh
+      # npm and pnpm projects: what goes out is what was just run.
+      - run: pnpm pack:verify
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages
+          path: build/pack/*.tgz
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # npm trusted publishing (OIDC)
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing needs npm >= 11.5.1; the runner ships an older one.
+      # Pinned as the engine repo pins it, to a release whose provenance signing works.
+      - run: npm install -g npm@11.5.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: packages
+      - name: Publish
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # The helper first: the wrapper pins it exactly, and must never be on
+          # the registry without it.
+          for name in driver-darwin driver; do
+            tarball="packages/vosjs-$name-$VERSION.tgz"
+            if [ ! -f "$tarball" ]; then
+              echo "::error::The build made no $tarball"
+              exit 1
+            fi
+            if [ "$EVENT" != "push" ]; then
+              echo "Rehearsal: @vosjs/$name@$VERSION"
+              npm publish "$tarball" --access public --dry-run
+            elif npm view "@vosjs/$name@$VERSION" version >/dev/null 2>&1; then
+              # A release that stopped halfway is finished by running it again.
+              echo "@vosjs/$name@$VERSION is already on npm: skipped."
+            else
+              npm publish "$tarball" --access public --provenance
+            fi
+          done
