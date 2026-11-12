@@ -1,6 +1,6 @@
 {
   "name": "@vosjs/driver-darwin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The macOS helper for @vosjs/driver: one universal binary (arm64 and x64), macOS 14 and later. Install @vosjs/driver, which brings this.",
   "license": "MIT",
   "author": "vosso",

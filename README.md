@@ -15,7 +15,7 @@ macOS 14 or later, Node 18 or later. `@vosjs/driver` is the typed API; it brings
 Early. What that means today:
 
 - **The helper is not signed with a Developer ID or notarised.** It carries an ad-hoc signature, which is enough to run. macOS therefore records its permissions against the app that launched it (your terminal, your editor, your agent's host), not against the helper.
-- The Intel half of the binary is built and has not been run on an Intel Mac yet.
+- The Intel half of the binary records real takes in CI, on a hosted Intel runner. It has not been run on a physical Intel Mac.
 - No audio, no webcam, no whole-display capture.
 - Other applications are left out of the picture by a list fixed when the take starts. An app launched during a take can appear over the window.
 
@@ -190,6 +190,22 @@ Layout:
 - `packages/driver-darwin/` `@vosjs/driver-darwin`, which carries the built helper.
 
 The two packages and the helper share one version and release together.
+
+## Release
+
+A release is a tag on `main`. The workflow (`.github/workflows/release.yml`) builds the helper on a Mac, runs the whole gate, and publishes both packages to npm through trusted publishing: there is no npm token anywhere.
+
+```bash
+node scripts/set-version.mjs 0.1.1   # both packages and the Swift source
+pnpm build && pnpm test
+# merge that to main, then, on main:
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The tag must name the version the tree says and its commit must be on `main`, or the workflow stops before it builds. A release that stopped halfway is finished by running it again: a package already on npm is skipped.
+
+Run by hand from the Actions tab, the same workflow is a rehearsal. It builds, packs and runs both publishes with `--dry-run`, and publishes nothing.
 
 ## Security
 
