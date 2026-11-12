@@ -92,8 +92,9 @@ export function runHelper(path, args, { stdin = 'ignore' } = {}) {
       resolve({ code, signal })
     })
   })
+  // A line with no `event` is not a line of the protocol: show it whole, it is the finding.
   const said = () =>
-    `it said [${events.map((e) => e.event + (e.code ? `:${e.code}` : '')).join(', ')}]` +
+    `it said [${events.map((e) => (typeof e.event === 'string' ? e.event + (e.code ? `:${e.code}` : '') : JSON.stringify(e))).join(', ')}]` +
     (stderr.trim() ? ` and wrote to stderr: ${stderr.trim()}` : '')
 
   /**

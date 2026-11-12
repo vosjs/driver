@@ -356,15 +356,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
 
     progress.at("starting the capture")
 
-    let s = SCStream(filter: filter, configuration: config, delegate: self)
-    try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQ)
-    try await limited("The start of the capture") {
-      try await s.startCapture()
-      return Handed(value: ())
-    }
-    progress.at("waiting for the window's first frame to reach the file")
-    stream = s
-
+    // Everything the frame handler and `stop` read is in place BEFORE the capture starts:
+    // frames can arrive before `startCapture` returns, and on a slow machine they do.
+    //
     // `ready` is said when the first frame is in the file (see the frame handler): only then
     // does the take have a time zero for anything that follows to be measured against.
     readyEvent = [
@@ -373,6 +367,15 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "scale": scale, "captureWidth": w, "captureHeight": h, "filter": filterKind,
       "accessibility": AXIsProcessTrusted(),
     ]
+    let s = SCStream(filter: filter, configuration: config, delegate: self)
+    try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQ)
+    stream = s
+    try await limited("The start of the capture") {
+      try await s.startCapture()
+      return Handed(value: ())
+    }
+    progress.at("waiting for the window's first frame to reach the file")
+
     // A take with no frame in its file would leave the caller waiting on `ready` for good:
     // a window that never draws, or frames the writer will not take.
     DispatchQueue.global().asyncAfter(deadline: .now() + FIRST_FRAME_SECONDS) { [weak self] in

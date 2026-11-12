@@ -256,6 +256,11 @@ describe('recording a window', { skip }, () => {
     const begun = Date.now()
     const stopped = await run.event('stopped')
     assert.equal(stopped.reason, 'cap')
+    // every line the helper prints is an event of the protocol, and these are all of them
+    assert.deepEqual(
+      run.events.map((e) => e.event),
+      ['ready', 'stopped'],
+    )
     assert.ok(Date.now() - begun >= 900, 'it ran to its ceiling')
     assert.deepEqual(await within(run.exit, WAIT, 'the helper exiting'), { code: 0, signal: null })
   })
@@ -268,6 +273,10 @@ describe('recording a window', { skip }, () => {
     run.child.stdin.end() // what the helper sees when its parent is gone
     const stopped = await run.event('stopped')
     assert.equal(stopped.reason, 'parent-gone')
+    assert.deepEqual(
+      run.events.map((e) => e.event),
+      ['ready', 'stopped'],
+    )
     assert.ok(existsSync(stopped.files.recording))
     assert.deepEqual(await within(run.exit, WAIT, 'the helper exiting'), { code: 0, signal: null })
   })
@@ -280,6 +289,10 @@ describe('recording a window', { skip }, () => {
     run.child.kill('SIGTERM')
     const stopped = await run.event('stopped')
     assert.equal(stopped.reason, 'terminated')
+    assert.deepEqual(
+      run.events.map((e) => e.event),
+      ['ready', 'stopped'],
+    )
     assert.equal(boxType(stopped.files.recording), 'ftyp')
     assert.deepEqual(await within(run.exit, WAIT, 'the helper exiting'), { code: 0, signal: null })
   })
