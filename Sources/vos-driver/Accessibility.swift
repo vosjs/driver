@@ -328,6 +328,9 @@ let ACTED_ON: Set<String> = [
   "incrementor", "colorwell", "switch", "toggle", "cell", "row",
 ]
 
+/// The window's own controls. They are not part of what a script shows.
+let WINDOW_CONTROLS: Set<String> = ["AXCloseButton", "AXMinimizeButton", "AXZoomButton", "AXFullScreenButton"]
+
 /// The outline of a window for someone about to script it: each element worth naming, with
 /// ONE selector proposed for it, and whether that selector names it alone.
 func outline(_ root: Node, window: CGRect) -> [[String: Any]] {
@@ -336,6 +339,8 @@ func outline(_ root: Node, window: CGRect) -> [[String: Any]] {
   for n in all {
     let interesting = ACTED_ON.contains(n.role) || TYPED_INTO.contains(n.role) || !n.name.isEmpty || !n.id.isEmpty
     guard interesting, n.frame.width > 0, n.frame.height > 0, n.frame.intersects(window) else { continue }
+    // The window's own close, minimise and zoom buttons: pressing one ends the take.
+    if n.role == "button", WINDOW_CONTROLS.contains(axString(n.element, kAXSubroleAttribute as String)) { continue }
     // The identifier first: it is the one a maker set, and the one that survives a redesign.
     var selector = n.role
     if !n.id.isEmpty {

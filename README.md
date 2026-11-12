@@ -99,7 +99,7 @@ A **selector** is a short path of steps. Each step is a role, then what the elem
 | `button[name='Delete']:nth(1)`   | The second match, counted from 0.                          |
 | `*[id='sidebar']`                | Any role.                                                  |
 
-A role is the accessibility role in lower case without its `AX` (`button`, `checkbox`, `textfield`, `textarea`, `link`, `menuitem`, `row`, `cell`), with `text` for static text, `radio` for a radio button and `popup` for a pop-up button. `tree` proposes one selector per element, the identifier first because it is the one that survives a redesign, and says whether it names that element alone.
+A role is the accessibility role in lower case without its `AX` (`button`, `checkbox`, `textfield`, `textarea`, `link`, `menuitem`, `row`, `cell`), with `text` for static text, `radio` for a radio button and `popup` for a pop-up button. `tree` proposes one selector per element, the identifier first because it is the one that survives a redesign, and says whether it names that element alone. It leaves out the window's own close, minimise and zoom buttons: pressing one ends the take.
 
 | Command                                                  | What it does                                                                                                 |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -115,7 +115,7 @@ A role is the accessibility role in lower case without its `AX` (`button`, `chec
 
 A target is a `selector`, or `x` and `y` in the window's own points. Commands run one at a time in the order sent, and each answer carries `tStart` and `tEnd` in milliseconds on the take's clock, which is where the act is in the footage. A command that did nothing resolves with `ok: false`, a `code` (`not-found`, `not-in-view`, `not-frontmost`, `bad-request`, `no-tree`) and a `message`; the take goes on and the script decides.
 
-Input is posted where a mouse's and a keyboard's enter the system, so the app sees ordinary input and the pointer's path is sampled exactly as a person's is. Each press in `cursor.json` carries the bounds of the element the script named.
+Input is posted where a mouse's and a keyboard's enter the system, so the app sees ordinary input and the pointer's path is sampled exactly as a person's is. Before every key, the helper asks the system which app has the keyboard: if another app took it, typing stops there with `not-frontmost`, so a script's text never lands in another app. Each press in `cursor.json` carries the bounds of the element the script named.
 
 ## Use it from a shell
 

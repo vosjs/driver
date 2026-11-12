@@ -105,7 +105,7 @@ final class Driver: @unchecked Sendable {
   /// The app in front, where input goes. A take that acts on an app nobody can see acts on
   /// another one.
   func forward() throws {
-    if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return }
+    if frontmostPid() == pid { return }
     let f = try frame()
     guard bringForward(pid: pid, window: windowElement(pid, frame: f)) else {
       throw InputError(code: "not-frontmost", message: "The app could not be brought to the front, so input would go to another one.")
@@ -180,7 +180,13 @@ final class Driver: @unchecked Sendable {
           answer["count"] = t.count
           if let r = t.rect { answer["rect"] = rectJSON(r, try frame()) }
         }
-        typeText(text, delayMs: (cmd["delayMs"] as? NSNumber)?.doubleValue ?? 70)
+        let app = pid
+        guard typeText(text, delayMs: (cmd["delayMs"] as? NSNumber)?.doubleValue ?? 70, stillThere: { frontmostPid() == app })
+        else {
+          throw InputError(
+            code: "not-frontmost",
+            message: "Another app took the keyboard while the script was typing, so typing stopped there.")
+        }
       case "press":
         try forward()
         let chords = (cmd["keys"] as? [String]) ?? (cmd["keys"] as? String).map { [$0] } ?? []
@@ -188,6 +194,12 @@ final class Driver: @unchecked Sendable {
           throw InputError(code: "bad-request", message: "press takes keys: a chord like Meta+S, or a list of them.")
         }
         for chord in chords {
+          // A chord sent to the wrong app does something there: Meta+W, Meta+Q.
+          guard frontmostPid() == pid else {
+            throw InputError(
+              code: "not-frontmost",
+              message: "Another app took the keyboard, so the keys were not pressed.")
+          }
           try pressKeys(chord)
           usleep(80_000)
         }

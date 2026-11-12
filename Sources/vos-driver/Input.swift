@@ -74,8 +74,12 @@ func press(at p: CGPoint, count: Int = 1, right: Bool = false, flags: CGEventFla
 
 /// Types text as a person does, a character at a time. Each character is posted as itself, not
 /// as a key of some layout, so what arrives is what the script says on any keyboard.
-func typeText(_ text: String, delayMs: Double) {
+///
+/// `stillThere` is asked before every character. When it says no, typing stops there and
+/// this returns false: what a script types must never land in another app.
+func typeText(_ text: String, delayMs: Double, stillThere: () -> Bool = { true }) -> Bool {
   for character in text {
+    guard stillThere() else { return false }
     let units = Array(String(character).utf16)
     for down in [true, false] {
       guard let e = CGEvent(keyboardEventSource: inputSource, virtualKey: 0, keyDown: down) else { continue }
@@ -85,6 +89,7 @@ func typeText(_ text: String, delayMs: Double) {
     }
     usleep(UInt32(max(0, delayMs) * 1000))
   }
+  return true
 }
 
 /// Keys a script names, by where they are on the keyboard.
@@ -168,6 +173,20 @@ func scroll(dy: Double, dx: Double, ms: Double) {
   }
 }
 
+/// The app the keyboard goes to, asked of the system now. (`NSWorkspace` answers from what
+/// it last heard, and a tool with no run loop hears nothing.)
+func frontmostPid() -> pid_t? {
+  var value: CFTypeRef?
+  if AXUIElementCopyAttributeValue(
+    AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as CFString, &value) == .success,
+    let app = value
+  {
+    var pid: pid_t = 0
+    if AXUIElementGetPid(app as! AXUIElement, &pid) == .success { return pid }
+  }
+  return NSWorkspace.shared.frontmostApplication?.processIdentifier
+}
+
 /// Brings the app and its window to the front, and waits until it is there.
 func bringForward(pid: pid_t, window: AXUIElement?) -> Bool {
   guard let app = NSRunningApplication(processIdentifier: pid) else { return false }
@@ -178,8 +197,8 @@ func bringForward(pid: pid_t, window: AXUIElement?) -> Bool {
   }
   let deadline = CACurrentMediaTime() + 3
   while CACurrentMediaTime() < deadline {
-    if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return true }
+    if frontmostPid() == pid { return true }
     usleep(50_000)
   }
-  return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+  return frontmostPid() == pid
 }

@@ -118,6 +118,12 @@ describe('scripting a window', { skip }, () => {
         ],
       )
       assert.ok(again[0].rect.x < again[1].rect.x, 'in reading order')
+
+      // The window's own close, minimise and zoom buttons are not offered: pressing one ends the take.
+      assert.deepEqual(
+        outline.elements.filter((e) => e.role === 'button').map((e) => e.name),
+        ['Save', 'Again', 'Again'],
+      )
     },
   )
 
@@ -248,14 +254,11 @@ describe('scripting a window', { skip }, () => {
     assert.equal(unknown.ok, false)
     assert.equal(unknown.code, 'bad-request')
 
-    // The disabled zoom button of the title bar: reached, and not pressed.
-    const outline = await within(tree({ window: fixture.id }), WAIT, 'tree()')
-    const off = outline.elements.find((e) => e.role === 'button' && !e.enabled)
-    if (off) {
-      const reached = await t.send({ do: 'click', selector: off.selector })
-      assert.equal(reached.ok, true)
-      assert.equal(reached.pressed, false)
-    }
+    // The fixture's title bar has a disabled zoom button: reached, and not pressed.
+    const off = await t.send({ do: 'click', selector: 'button:nth(4)' })
+    assert.equal(off.ok, true)
+    assert.equal(off.enabled, false)
+    assert.equal(off.pressed, false)
 
     const now = await t.send({ do: 'now' })
     assert.equal(now.ok, true)
