@@ -78,6 +78,12 @@ function crashed(code: number | null, signal: NodeJS.Signals | null, stderr: str
   )
 }
 
+/**
+ * The longest a verb that answers once is waited for. The helper's own limits are shorter,
+ * so its words arrive first; this is for a helper that says nothing at all.
+ */
+const ANSWER_MS = 45_000
+
 /** Runs a verb that prints its events and exits. */
 function collect(args: string[]): Promise<DriverEvent[]> {
   return new Promise((resolve, reject) => {
@@ -95,9 +101,19 @@ function collect(args: string[]): Promise<DriverEvent[]> {
     const settle = (failure?: DriverError) => {
       if (settled) return
       settled = true
+      clearTimeout(late)
       if (failure) reject(failure)
       else resolve(events)
     }
+    const late = setTimeout(() => {
+      child.kill('SIGKILL')
+      settle(
+        new DriverError(
+          'crashed',
+          `The helper did not answer \`${args[0]}\` within ${ANSWER_MS / 1000} s, and was ended.`,
+        ),
+      )
+    }, ANSWER_MS)
     child.stdout!.setEncoding('utf8').on('data', reader.feed)
     child.stderr!.setEncoding('utf8').on('data', (chunk: string) => {
       stderr = (stderr + chunk).slice(-STDERR_TAIL)

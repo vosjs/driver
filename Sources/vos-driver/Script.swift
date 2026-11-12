@@ -303,6 +303,8 @@ func cmdTree(_ json: String) {
     let req = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
   else { fail("bad-request", "The tree request is not a JSON object.") }
   guard AXIsProcessTrusted() else { fail("accessibility", ACCESSIBILITY_NEEDED) }
+  // An app that does not answer accessibility holds every question for seconds.
+  answerWithin(BEGIN_SECONDS, "Reading the window's outline")
   guard let found = appWindow(req) else { fail("no-window", "No window matches the request.") }
   // A tree that was only just asked for takes a moment to be built (Chromium, Electron).
   var root = readTree(found.window)

@@ -1179,6 +1179,18 @@ func resizeWindow(pid: pid_t, frame: CGRect, to size: CGSize) -> Bool {
   return axRect(window) != nil
 }
 
+/// A verb that answers once and exits must do so in bounded time, whatever the system or the
+/// app it asks does: past the limit it says what it was doing and ends.
+func answerWithin(_ seconds: Double, _ what: String) {
+  DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+    emit([
+      "event": "error", "code": "start-failed",
+      "message": "\(what) did not finish within \(Int(seconds)) s.",
+    ])
+    exit(1)
+  }
+}
+
 /// `still`: one picture of the window, as a take would show it, for someone about to script it.
 func cmdStill(_ json: String) async {
   guard let data = json.data(using: .utf8),
@@ -1187,6 +1199,7 @@ func cmdStill(_ json: String) async {
   guard let out = req["out"] as? String, !out.isEmpty else {
     fail("bad-request", "The request names no out file.")
   }
+  answerWithin(BEGIN_SECONDS, "The picture of the window")
   let content = await shareable()
   guard let w = requestedWindow(req, content), let app = w.owningApplication,
     let display = content.displays.first(where: { $0.frame.intersects(w.frame) }) ?? content.displays.first

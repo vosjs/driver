@@ -34,6 +34,16 @@ const skip = !onMac
         : false
 
 const WAIT = 40_000
+
+// The whole file has a limit too. Whatever holds this process open past it (a helper that
+// never exits, a window that never closes) fails the run here, in words, with the output
+// above it, and not at the job's timeout with none.
+setTimeout(() => {
+  console.error(
+    'This test file was still running after 5 minutes: something it started never ended.',
+  )
+  process.exit(1)
+}, 300_000).unref()
 const TEST = { timeout: 120_000 }
 
 describe('scripting a window', { skip }, () => {
