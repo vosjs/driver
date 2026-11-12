@@ -7,7 +7,8 @@
 //   - that version is not already on npm in full (a release that stopped halfway,
 //     with one package out, may be run again to finish).
 //
-// A rehearsal (EVENT=workflow_dispatch) must be run from main, and publishes nothing.
+// A rehearsal (EVENT=workflow_dispatch) publishes nothing, so it may run from any branch:
+// that is how a change to the release itself is tried before it is merged.
 //
 // It writes `version=<version>` to $GITHUB_OUTPUT.
 import { execFileSync } from 'node:child_process'
@@ -66,8 +67,7 @@ if (event === 'push') {
   }
   console.log(`Releasing ${version} from ${ref}.`)
 } else if (event === 'workflow_dispatch') {
-  if (ref !== 'main') stop(`a rehearsal runs from main, and this is ${ref}.`)
-  console.log(`Rehearsing the release of ${version}. Nothing is published.`)
+  console.log(`Rehearsing the release of ${version} from ${ref}. Nothing is published.`)
 } else {
   stop(`it is run by a pushed tag or by hand, and this is "${event}".`)
 }

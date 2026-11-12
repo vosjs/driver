@@ -16,7 +16,8 @@
 # test ships ever runs beside the credential.
 #
 # Run by hand (workflow_dispatch) it is a REHEARSAL: the same build, then both
-# publishes with --dry-run. A rehearsal never publishes.
+# publishes with --dry-run. A rehearsal never publishes, so it may run from any
+# branch, which is how a change to this file is tried before it is merged.
 #
 # Every action is pinned to a commit, with its version beside it; Dependabot
 # moves the pins (.github/dependabot.yml).

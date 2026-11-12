@@ -205,7 +205,7 @@ git push origin v0.1.1
 
 The tag must name the version the tree says and its commit must be on `main`, or the workflow stops before it builds. A release that stopped halfway is finished by running it again: a package already on npm is skipped.
 
-Run by hand from the Actions tab, the same workflow is a rehearsal. It builds, packs and runs both publishes with `--dry-run`, and publishes nothing.
+Run by hand from the Actions tab, the same workflow is a rehearsal. It builds, packs and runs both publishes with `--dry-run`, and publishes nothing, from any branch.
 
 ## Security
 
