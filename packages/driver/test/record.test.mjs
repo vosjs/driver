@@ -274,12 +274,22 @@ describe('recording a window', { skip }, () => {
         `the capture learned of the other application (${did})`,
       )
       assert.ok(stopped.frames >= 5, `the take went on (${did})`)
-      // Every tenth of a second, from before the other window opened to the end.
+      // Every twentieth of a second, from before the other window opened to the end.
       const end = stopped.durationMs / 1000 - 0.05
-      for (let at = 0.1; at < end; at += 0.1) {
+      const seen = []
+      for (let at = 0.1; at < end; at += 0.05) {
         const [patch] = probe(stopped.files.recording, at, CONTENT[0])
-        assert.ok(isFixtureBlue(patch), `at ${at.toFixed(1)} s the content is ${patch} (${did})`)
+        seen.push({ at: at.toFixed(2), patch })
       }
+      const wrong = seen.filter((s) => !isFixtureBlue(s.patch))
+      // On failure, when the other window showed and for how long says what went wrong:
+      // the whole run of samples, by their red channel.
+      assert.equal(
+        wrong.length,
+        0,
+        `the other window is in ${wrong.length} of ${seen.length} samples, first at ${wrong[0]?.at} s as ${wrong[0]?.patch}; ` +
+          `red over time: ${seen.map((s) => s.patch[0]).join(' ')} (${did})`,
+      )
     } finally {
       other.close()
       await sleep(300)
