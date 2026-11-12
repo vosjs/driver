@@ -399,16 +399,23 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     arrived += 1
     let pts = CMSampleBufferGetPresentationTimeStamp(sb).seconds
     let now = CACurrentMediaTime()
+    let lag = now - pts
+    arrivalLagSum += lag
+    arrivalLagMax = max(arrivalLagMax, lag)
+    // A frame the writer cannot take now is let go (an encoder still warming up does this).
+    // It defines nothing: time zero is the first frame that REACHES the file.
+    guard input.isReadyForMoreMediaData else {
+      dropped += 1
+      return
+    }
     if t0Host == nil {
       t0Host = pts
       t0Wall = Date().timeIntervalSince1970 * 1000 - (now - pts) * 1000
       writer.startSession(atSourceTime: .zero)
     }
-    let lag = now - pts
-    arrivalLagSum += lag
-    arrivalLagMax = max(arrivalLagMax, lag)
     let rel = pts - t0Host!
-    guard rel >= lastPTS, input.isReadyForMoreMediaData else {
+    // Times in the file only go forward.
+    guard frames == 0 || rel > lastPTS else {
       dropped += 1
       return
     }
@@ -614,7 +621,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "files": ["recording": recordingFile.path, "cursor": cursorFile.path, "meta": metaFile.path],
       "clock": [
         "t0Host": t0Host ?? 0,
-        "arrivalLagMsMean": frames > 0 ? r1(arrivalLagSum / Double(frames + dropped) * 1000) : 0,
+        "arrivalLagMsMean": arrived > 0 ? r1(arrivalLagSum / Double(arrived) * 1000) : 0,
         "arrivalLagMsMax": r1(arrivalLagMax * 1000),
       ],
     ])
