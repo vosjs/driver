@@ -104,7 +104,9 @@ jobs:
           # The helper first: the wrapper pins it exactly, and must never be on
           # the registry without it.
           for name in driver-darwin driver; do
-            tarball="packages/vosjs-$name-$VERSION.tgz"
+            # The leading ./ matters: npm reads a bare `packages/x.tgz` as a GitHub
+            # shorthand (owner/repo) and tries to clone it.
+            tarball="./packages/vosjs-$name-$VERSION.tgz"
             if [ ! -f "$tarball" ]; then
               echo "::error::The build made no $tarball"
               exit 1
