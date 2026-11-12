@@ -1,6 +1,6 @@
-# vos-capture
+# vos-driver
 
-A headless capture helper for [vos](https://github.com/vosjs/vos) takes of desktop apps. One process per take, no window, no settings, no state.
+A headless helper that records desktop apps for [vos](https://github.com/vosjs/vos) takes of desktop apps. One process per take, no window, no settings, no state.
 
 It records one application's window with the system pointer left out of the pixels, and writes the pointer's path beside the video, so an editor can draw the pointer, zoom to what was pressed and speed through what was not.
 
@@ -9,15 +9,15 @@ Status: a spike. macOS 14 or later; built and run so far on Apple silicon, macOS
 ## Build
 
 ```bash
-swiftc -O -swift-version 5 -parse-as-library Sources/vos-capture/main.swift -o build/vos-capture
+swiftc -O -swift-version 5 -parse-as-library Sources/vos-driver/main.swift -o build/vos-driver
 ```
 
 ## Use
 
 ```bash
-vos-capture check                       # permissions, as JSON
-vos-capture windows                     # windows that can be captured, one JSON object per line
-vos-capture record '{"app":"TextEdit","out":"./take"}'
+vos-driver check                       # permissions, as JSON
+vos-driver windows                     # windows that can be captured, one JSON object per line
+vos-driver record '{"app":"TextEdit","out":"./take"}'
 ```
 
 `record` prints `ready`, then `stopped`, as JSON lines on stdout. It ends on `stop` and a newline on stdin, on Ctrl-C, or at `maxSeconds`. The `out` directory then holds:

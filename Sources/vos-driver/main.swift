@@ -1,8 +1,8 @@
-// vos-capture: a headless capture helper. One process per take, no window, no state.
+// vos-driver: a headless helper that records one application window for a vos take. One process per take, no window, no state.
 //
-//   vos-capture check                 permissions, as JSON (run from a fresh process)
-//   vos-capture windows               windows that can be captured, as JSON lines
-//   vos-capture record '<json>'       record one window; NDJSON on stdout; "stop\n" on stdin ends it
+//   vos-driver check                 permissions, as JSON (run from a fresh process)
+//   vos-driver windows               windows that can be captured, as JSON lines
+//   vos-driver record '<json>'       record one window; NDJSON on stdout; "stop\n" on stdin ends it
 //
 // record request:
 //   { "window": 1234 | "app": "TextEdit",   target (window id wins)
@@ -124,8 +124,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
   var stream: SCStream?
   var writer: AVAssetWriter!
   var input: AVAssetWriterInput!
-  let videoQ = DispatchQueue(label: "vos.capture.video")
-  let pointerQ = DispatchQueue(label: "vos.capture.pointer")
+  let videoQ = DispatchQueue(label: "vos.driver.video")
+  let pointerQ = DispatchQueue(label: "vos.driver.pointer")
   var timer: DispatchSourceTimer?
 
   // clock: zero is the first frame the file holds, on the host clock (seconds)
@@ -511,7 +511,7 @@ struct Main {
     case "windows": await cmdWindows()
     case "record": await cmdRecord(args.count > 2 ? args[2] : "")
     default:
-      FileHandle.standardError.write("usage: vos-capture check | windows | record '<json>'\n".data(using: .utf8)!)
+      FileHandle.standardError.write("usage: vos-driver check | windows | record '<json>'\n".data(using: .utf8)!)
       exit(2)
     }
     exit(0)
