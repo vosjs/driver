@@ -48,7 +48,148 @@ export interface RecordRequest {
   frames?: boolean
   /** Default `others-out`. */
   filter?: CaptureFilter
+  /**
+   * A scripted take: the app is brought to the front before the capture, and the take
+   * accepts commands (`Recording.send`). Needs Accessibility. Default false.
+   */
+  drive?: boolean
+  /**
+   * Give the window this size, in points, before the capture. Needs Accessibility. An app
+   * may refuse a size (its minimum, its screen); `ready.frame` says what the take is.
+   */
+  size?: { w: number; h: number }
 }
+
+/** What `tree` and `still` are asked about. Give `window` or `app`. */
+export interface WindowRequest {
+  /** A window id from `windows()`. Wins over `app`. */
+  window?: number
+  /** An application's name or bundle id: its main window. */
+  app?: string
+}
+
+/** One element of a window that a script can name. */
+export interface TreeElement {
+  /** `button`, `textfield`, `checkbox`, `text`, `link`, `menuitem`, and so on. */
+  role: string
+  /** A selector that names this element. Pass it to a command as it is. */
+  selector: string
+  /** False when the selector needed `:nth(n)` to be this element: it names by position. */
+  unique: boolean
+  enabled: boolean
+  /** In the window's own points. */
+  rect: Rect
+  /** What the interface calls it: a title, a label's words, a field's placeholder. */
+  name?: string
+  /** The accessibility identifier, when the app's maker set one. */
+  id?: string
+}
+
+/**
+ * The outline of a window: each element worth naming. The contents of anything a person
+ * types into are never in it.
+ */
+export interface TreeResult {
+  app: string
+  /** The window's size in points. */
+  window: { w: number; h: number }
+  elements: TreeElement[]
+}
+
+export interface TreeEvent extends TreeResult {
+  event: 'tree'
+}
+
+/** One picture of a window, as a take would show it. */
+export interface StillResult {
+  /** The PNG's absolute path. */
+  out: string
+  app: string
+  window: number
+  /** The picture's size in pixels. */
+  width: number
+  height: number
+  /** Pixels per point. */
+  scale: number
+  /** The window's frame in global points. */
+  frame: Rect
+}
+
+export interface StillEvent extends StillResult {
+  event: 'still'
+}
+
+/** What a command acts on: an element by selector, or a point in the window's own points. */
+export type CommandTarget = { selector: string } | { x: number; y: number }
+
+/**
+ * One act of a scripted take. The pointer travels to its target as a hand does, and what
+ * it does is in the take's cursor track like any person's.
+ *
+ * A selector is a short path: `button[name='Save']`, `textfield[id='title']`,
+ * `toolbar > button[name*='Share']`, `button[name='Delete']:nth(1)`, `*[id='sidebar']`.
+ */
+export type Command =
+  /** Finds without acting: how many match, and where the first is. */
+  | ({ do: 'locate' } & CommandTarget)
+  | ({
+      do: 'click'
+      count?: number
+      button?: 'left' | 'right'
+      modifiers?: Modifier[]
+    } & CommandTarget)
+  | ({ do: 'hover' } & CommandTarget)
+  /** Types text, a character at a time. With a target, presses it first. */
+  | ({ do: 'type'; text: string; delayMs?: number } & Partial<CommandTarget>)
+  /** A chord like `Meta+S` or `Enter`, or several in order. */
+  | { do: 'press'; keys: string | string[] }
+  /** Turns the wheel, in points; positive `dy` scrolls down. With a target, over it. */
+  | ({ do: 'scroll'; dy?: number; dx?: number; ms?: number } & Partial<CommandTarget>)
+  | ({ do: 'drag'; to: CommandTarget; ms?: number; modifiers?: Modifier[] } & CommandTarget)
+  /** Moves the pointer and does nothing else. */
+  | ({ do: 'move'; ms?: number } & CommandTarget)
+  /** Does nothing: its answer's `tEnd` is the take's clock, now. */
+  | { do: 'now' }
+
+/** A key held through a click or a drag. */
+export type Modifier = 'Meta' | 'Control' | 'Alt' | 'Shift'
+
+/** Why a command did nothing. */
+export type CommandFailureCode =
+  | 'bad-request'
+  /** Nothing in the window matches the selector. */
+  | 'not-found'
+  /** The element is there, outside the window's visible area. */
+  | 'not-in-view'
+  /** The app could not be brought to the front, so input would go to another one. */
+  | 'not-frontmost'
+  /** The take has not begun: wait for `ready`. */
+  | 'not-ready'
+  | 'accessibility'
+  | 'no-window'
+  /** The window offers no accessibility tree. */
+  | 'no-tree'
+  | 'failed'
+
+/** A command's answer. Times are milliseconds on the take's clock: its extent in the footage. */
+export type CommandResult =
+  | {
+      ok: true
+      tStart: number
+      tEnd: number
+      /** How many elements the selector matches. The first is the one acted on. */
+      count?: number
+      enabled?: boolean
+      /** `locate` only: what the interface calls the element. Never what was typed into it. */
+      name?: string
+      /** The element's bounds, in the window's own points. */
+      rect?: Rect
+      /** `click` only: false when the element is disabled, so it was reached and not pressed. */
+      pressed?: boolean
+    }
+  | { ok: false; code: CommandFailureCode; message: string }
+
+export type ResultEvent = { event: 'result'; id?: number } & CommandResult
 
 /** What the helper may do, and what it is. */
 export interface CheckResult {
@@ -177,6 +318,10 @@ export type HelperErrorCode =
   | 'no-frames'
   /** The recording or its files could not be written. */
   | 'write-failed'
+  /** Accessibility is not granted to the app that launched the helper, and the request needs it. */
+  | 'accessibility'
+  /** The window offers no accessibility tree. */
+  | 'no-tree'
 
 export interface ErrorEvent {
   event: 'error'
@@ -200,4 +345,13 @@ export interface WindowEvent extends DriverWindow {
 
 /** Every line the helper prints. */
 export type DriverEvent =
-  VersionEvent | CheckEvent | WindowEvent | ReadyEvent | StoppedEvent | NoticeEvent | ErrorEvent
+  | VersionEvent
+  | CheckEvent
+  | WindowEvent
+  | TreeEvent
+  | StillEvent
+  | ReadyEvent
+  | ResultEvent
+  | StoppedEvent
+  | NoticeEvent
+  | ErrorEvent

@@ -2,7 +2,7 @@
 
 Records a desktop app's window for a [vos](https://github.com/vosjs/vos) take.
 
-It writes a video of one window with the system pointer left out of the pixels, and the pointer's path beside it, so an editor can draw the pointer itself, zoom to what was pressed and speed through what was not. The work is done by a small native helper with no window of its own, no settings and no state: one process per take.
+It writes a video of one window with the system pointer left out of the pixels, and the pointer's path beside it, so an editor can draw the pointer itself, zoom to what was pressed and speed through what was not. The take is performed by a person, or scripted: the helper finds the app's controls through accessibility and presses, types and scrolls as a hand would. The work is done by a small native helper with no window of its own, no settings and no state: one process per take.
 
 ```bash
 npm i @vosjs/driver
@@ -17,6 +17,7 @@ Early. What that means today:
 - **The helper is not signed with a Developer ID or notarised.** It carries an ad-hoc signature, which is enough to run. macOS therefore records its permissions against the app that launched it (your terminal, your editor, your agent's host), not against the helper.
 - The Intel half of the binary records real takes in CI, on a hosted Intel runner. It has not been run on a physical Intel Mac.
 - No audio, no webcam, no whole-display capture.
+- **A scripted take uses the machine's own pointer and keyboard.** The app comes to the front and the real pointer moves, so nobody else can use the machine while it runs. There is no background mode.
 
 ## Use it from JavaScript
 
@@ -39,38 +40,94 @@ console.log(stopped.durationMs, stopped.files.recording)
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `check()`                   | The helper's version, and whether Screen Recording and Accessibility are granted. Read by a fresh helper process every call. |
 | `windows()`                 | The windows on screen that can be recorded: `id`, `app`, `appId`, `titled`, `frame`.                                         |
-| `record(request, options?)` | Starts a take and returns at once: `ready`, `done`, `stop()`, `pid`.                                                         |
+| `record(request, options?)` | Starts a take and returns at once: `ready`, `done`, `stop()`, `send(command)`, `pid`.                                        |
+| `tree(request)`             | The outline of an app's window: each element a script can name, with a selector for it. Needs Accessibility.                 |
+| `still(request)`            | One PNG of the window as a take would show it: no pointer, nothing of any other app.                                         |
 | `driverPath()`              | Where the helper is on this machine.                                                                                         |
 | `DriverError`               | Every failure: read `code`, show `message`.                                                                                  |
 | `PROTOCOL_VERSION`          | The wire protocol this package speaks.                                                                                       |
 
 ### `record(request)`
 
-| Field        | Default        |                                                                               |
-| ------------ | -------------- | ----------------------------------------------------------------------------- |
-| `window`     |                | A window id from `windows()`. Wins over `app`.                                |
-| `app`        |                | An application's name or bundle id. Its largest titled window is recorded.    |
-| `out`        | required       | A directory. The take's three files are written there.                        |
-| `fps`        | `60`           | The frame-rate ceiling, 1 to 120. Frames are written only when pixels change. |
-| `bitrate`    | `8000000`      | The encoder's average bit rate.                                               |
-| `maxSeconds` | `3600`         | A safety ceiling. Pass your own.                                              |
-| `pointer`    | `true`         | Sample the real pointer into `cursor.json`.                                   |
-| `frames`     | `false`        | Read the bounds of what was pressed and typed in. Needs Accessibility.        |
-| `filter`     | `'others-out'` | How the window is scoped. Leave it alone; see [the filter](#the-filter).      |
+| Field        | Default        |                                                                                          |
+| ------------ | -------------- | ---------------------------------------------------------------------------------------- |
+| `window`     |                | A window id from `windows()`. Wins over `app`.                                           |
+| `app`        |                | An application's name or bundle id. Its largest titled window is recorded.               |
+| `out`        | required       | A directory. The take's three files are written there.                                   |
+| `fps`        | `60`           | The frame-rate ceiling, 1 to 120. Frames are written only when pixels change.            |
+| `bitrate`    | `8000000`      | The encoder's average bit rate.                                                          |
+| `maxSeconds` | `3600`         | A safety ceiling. Pass your own.                                                         |
+| `pointer`    | `true`         | Sample the real pointer into `cursor.json`.                                              |
+| `frames`     | `false`        | Read the bounds of what was pressed and typed in. Needs Accessibility.                   |
+| `filter`     | `'others-out'` | How the window is scoped. Leave it alone; see [the filter](#the-filter).                 |
+| `drive`      | `false`        | A scripted take: bring the app to the front, then take commands. Needs Accessibility.    |
+| `size`       |                | `{ w, h }` in points: give the window this size before the capture. Needs Accessibility. |
 
 `options.onEvent` receives every line the helper prints. `options.signal` ends the take as `stop()` does.
 
 A take ends when you call `stop()`, at `maxSeconds`, when the window's capture stops, and when the process that started it goes away. A recorder never outlives what started it.
+
+## Script a take
+
+Look at the window first, then act on it while it is recorded.
+
+```js
+import { record, tree } from '@vosjs/driver'
+
+const { elements } = await tree({ app: 'TextEdit' })
+// [{ role: 'button', name: 'Save', selector: "button[name='Save']", unique: true, rect, enabled }, ...]
+
+const take = record({ app: 'TextEdit', out: './take', drive: true })
+await take.ready
+
+await take.send({ do: 'type', selector: 'textarea', text: 'Hello from a script.' })
+await take.send({ do: 'press', keys: 'Meta+S' })
+const click = await take.send({ do: 'click', selector: "button[name='Save']" })
+// { ok: true, pressed: true, tStart, tEnd, rect }: its extent on the take's clock, and where
+
+await take.stop()
+```
+
+A **selector** is a short path of steps. Each step is a role, then what the element is called or its accessibility identifier:
+
+| Selector                         | Names                                                      |
+| -------------------------------- | ---------------------------------------------------------- |
+| `button[name='Save']`            | A button the interface calls Save.                         |
+| `textfield[id='issue-title']`    | The field whose accessibility identifier is `issue-title`. |
+| `button[name*='Share']`          | `*=` is contains, without regard to case.                  |
+| `toolbar > button[name='Share']` | `>` is a child; a space is any descendant.                 |
+| `button[name='Delete']:nth(1)`   | The second match, counted from 0.                          |
+| `*[id='sidebar']`                | Any role.                                                  |
+
+A role is the accessibility role in lower case without its `AX` (`button`, `checkbox`, `textfield`, `textarea`, `link`, `menuitem`, `row`, `cell`), with `text` for static text, `radio` for a radio button and `popup` for a pop-up button. `tree` proposes one selector per element, the identifier first because it is the one that survives a redesign, and says whether it names that element alone. It leaves out the window's own close, minimise and zoom buttons: pressing one ends the take.
+
+| Command                                                  | What it does                                                                                                 |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `{ do: 'locate', selector }`                             | Finds without acting: `count`, and the first match's `rect`, `name` and `enabled`.                           |
+| `{ do: 'click', selector, count?, button?, modifiers? }` | The pointer travels to the element and presses it. A disabled one is reached, not pressed: `pressed: false`. |
+| `{ do: 'hover', selector }`                              | The pointer travels there and stays.                                                                         |
+| `{ do: 'type', text, selector?, delayMs? }`              | Presses the target if one is given, then types a character at a time.                                        |
+| `{ do: 'press', keys }`                                  | A chord (`Meta+S`, `Enter`, `Shift+Tab`) or a list of them.                                                  |
+| `{ do: 'scroll', dy?, dx?, selector?, ms? }`             | Turns the wheel, in points, over the target or where the pointer is.                                         |
+| `{ do: 'drag', selector, to, ms?, modifiers? }`          | Presses on the target, travels to `to` and lets go.                                                          |
+| `{ do: 'move', x, y, ms? }`                              | Moves the pointer and does nothing else.                                                                     |
+| `{ do: 'now' }`                                          | Nothing: its `tEnd` is the take's clock.                                                                     |
+
+A target is a `selector`, or `x` and `y` in the window's own points. Commands run one at a time in the order sent, and each answer carries `tStart` and `tEnd` in milliseconds on the take's clock, which is where the act is in the footage. A command that did nothing resolves with `ok: false`, a `code` (`not-found`, `not-in-view`, `not-frontmost`, `bad-request`, `no-tree`) and a `message`; the take goes on and the script decides.
+
+Input is posted where a mouse's and a keyboard's enter the system, so the app sees ordinary input and the pointer's path is sampled exactly as a person's is. Before every key, the helper asks the system which app has the keyboard: if another app took it, typing stops there with `not-frontmost`, so a script's text never lands in another app. Each press in `cursor.json` carries the bounds of the element the script named.
 
 ## Use it from a shell
 
 ```bash
 npx vos-driver check
 npx vos-driver windows
+npx vos-driver tree '{"app":"TextEdit"}'
+npx vos-driver still '{"app":"TextEdit","out":"./look.png"}'
 npx vos-driver record '{"app":"TextEdit","out":"./take"}'   # Ctrl-C ends the take
 ```
 
-The helper prints one JSON object per line. `record` prints `ready`, then `stopped` or `error`, and exits 0 or 1.
+The helper prints one JSON object per line. `record` prints `ready`, then `stopped` or `error`, and exits 0 or 1. While it records, a line on its stdin is `stop` or one JSON command, answered with a `result` line.
 
 ## The take
 
@@ -128,20 +185,21 @@ This is the take the vos CLI reads, from `@vosjs/cli` 0.87.1: `npx vos plan take
 
 ## Permissions
 
-| Grant            | Needed for                                                                        |
-| ---------------- | --------------------------------------------------------------------------------- |
-| Screen Recording | Everything but `check` and `version`.                                             |
-| Accessibility    | `frames: true` only. Without it a take still has its pointer, presses and typing. |
+| Grant            | Needed for                                                                                                 |
+| ---------------- | ---------------------------------------------------------------------------------------------------------- |
+| Screen Recording | Everything but `check` and `version`.                                                                      |
+| Accessibility    | `tree`, a scripted take (`drive`, `size`, every command), and `frames: true`. A performed take needs none. |
 
-Never Input Monitoring.
+Never Input Monitoring: the helper posts input, it does not listen to it.
 
 macOS grants these to the app that launched the helper. If `check()` says `screenRecording: false`, switch it on for that app in System Settings, Privacy & Security, Screen & System Audio Recording, then start it again.
 
 ## What it never does
 
 - **Put the system pointer in the picture.**
-- **Learn what was typed.** Typing is the system's count of key presses going up. No key code ever reaches the helper, and there is no keyboard listener in it to receive one.
-- **Read text.** With `frames: true` it reads where things are (an element's bounds, the insertion point's position), never what they say.
+- **Learn what was typed.** Typing is the system's count of key presses going up. No key a person presses ever reaches the helper, and there is no keyboard listener in it to receive one. The text a script types is the script's own: it is posted to the app and written nowhere.
+- **Read what is in a field.** The value of anything a person types into (a text field, a text area, a search field, a password field) is never read, by any verb. A field is called by its placeholder or its label.
+- **Read the interface unless asked.** `tree` and a command's selector read what the interface calls its elements: titles, descriptions, and the words of labels and other static text, which in some apps is content (a message in a list, a file's name). That goes to whoever called the helper and nowhere else. A performed take reads none of it; with `frames: true` it reads where things are, never what they say.
 - **Record anything but the one app.** Every window that is not the app's is excluded from the capture, which is cropped to the window and follows it when it moves. A window that opens over it mid-take (a notification, an app you launch) is excluded as soon as it appears, and the frames it could be in are held back, so it is not in the file for even one.
 - **Name a window.** `meta.json` holds the app's name and bundle id, never a window title.
 - **Send anything anywhere.** The helper has no network code. It writes three files into the directory it was given.
@@ -159,7 +217,9 @@ Every failure is a `DriverError` with a `code`.
 | `not-executable`       | The helper is there and cannot be run.                                    |
 | `protocol-mismatch`    | The helper and this package are different versions.                       |
 | `screen-recording`     | Screen Recording is not granted to the app that launched the helper.      |
-| `bad-request`          | The request is not what `record` takes.                                   |
+| `accessibility`        | Accessibility is not granted to the app that launched the helper.         |
+| `no-tree`              | The window offers no accessibility tree.                                  |
+| `bad-request`          | The request is not what the verb takes.                                   |
 | `no-window`            | No window on screen matches the request.                                  |
 | `start-failed`         | The capture could not start.                                              |
 | `no-frames`            | The take ended before the window drew a frame.                            |
