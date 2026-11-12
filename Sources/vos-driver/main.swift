@@ -39,8 +39,8 @@ import ScreenCaptureKit
 /// The wire protocol's version. It moves when a request field or an event changes meaning.
 let PROTOCOL = 1
 
-/// How the window is scoped. `others-out` is the display with every OTHER application excluded,
-/// cropped to the window: scope by exclusion. The rest name the window or its app, and on
+/// How the window is scoped. `others-out` is the display with every window that is not the
+/// app's excluded, cropped to the window: scope by exclusion. The rest name the window or its app, and on
 /// macOS 26 that makes the system draw its sharing control over the window's traffic lights,
 /// where it lands in the pixels. They are kept for measuring other macOS versions.
 let FILTERS = ["others-out", "window", "app", "display-window", "display"]
@@ -55,9 +55,9 @@ let DRAIN_SECONDS = 5.0
 /// it the helper says where it was and leaves: it never waits for good, whatever stalled.
 let BEGIN_SECONDS = 20.0
 
-/// How long frames are held for an owner the system's list of applications does not have yet.
-/// An application that has just opened its first window takes a moment to be listed; one that
-/// is still not listed after this is not going to be.
+/// How long frames are held for a window the system's list does not have yet. A window that
+/// has just opened takes a moment to be listed; one that is still not listed after this is
+/// not going to be.
 let STRANGER_SECONDS = 2.0
 
 /// No window's corners are rounder than this. A corner that reads rounder is a window that
@@ -271,18 +271,19 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   var filterRefreshes = 0
   var saidBeyond = false
 
-  // Who is kept out of the picture. Read by the frame handler, written when the list is
-  // brought up to date: behind `exLock`.
+  // What is kept out of the picture: every window on screen that is not the app's. Read by
+  // the frame handler, written when the list is brought up to date: behind `exLock`.
   let exLock = NSLock()
-  /// Applications the capture excludes.
-  var excluded: Set<pid_t> = []
-  /// Owners of windows the capture cannot exclude (the system does not list them as
-  /// applications). They are let through: holding frames for them would hold every frame.
-  var ignored: Set<pid_t> = []
-  /// Owners of windows seen over this one and not yet excluded or ignored, with the host
-  /// time each was first seen.
-  var unsettled: [pid_t: Double] = [:]
-  /// Frames taken before this host time may still show an application excluded since.
+  /// Windows the capture excludes.
+  var excluded: Set<CGWindowID> = []
+  /// Windows the capture cannot exclude (the system does not offer them for capture, so
+  /// there is nothing to exclude). They are let through: holding frames for one would hold
+  /// every frame.
+  var ignored: Set<CGWindowID> = []
+  /// Windows seen over this one and not yet excluded or ignored, with the host time each
+  /// was first seen.
+  var unsettled: [CGWindowID: Double] = [:]
+  /// Frames taken before this host time may still show a window excluded since.
   var cleanFrom = 0.0
   /// Frames held back because another application's window was over this one.
   var held = 0
@@ -353,17 +354,21 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       case "display": filter = SCContentFilter(display: display, excludingWindows: [])
       case "app": filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
       default:
-        // others-out: the display with every OTHER application excluded
-        let others = content.applications.filter { $0.processID != app.processID }
-        filter = SCContentFilter(display: display, excludingApplications: others, exceptingWindows: [])
+        // others-out: the display with every window that is not the app's excluded, the
+        // desktop's and the system's among them.
+        let others = try await othersOnScreen(app.processID)
+        filter = SCContentFilter(display: display, excludingWindows: others)
         excludesOthers = true
-        excluded = Set(others.map { $0.processID })
+        excluded = Set(others.map { $0.windowID })
       }
       // A rectangle of the display, where the window is now. It does not move by itself.
       followsWindow = true
       displayID = display.displayID
       displayOrigin = display.frame.origin
       appPID = app.processID
+      // What is over the window now and cannot be excluded is known from the start, so a
+      // take does not open by waiting on it.
+      if excludesOthers { ignored = (windowsOver() ?? []).subtracting(excluded) }
       appliedRect = CGRect(
         x: frame.minX - display.frame.minX, y: frame.minY - display.frame.minY, width: frame.width,
         height: frame.height)
@@ -653,90 +658,103 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     }
   }
 
-  /// The owners of windows that are over this one right now and are neither excluded from
-  /// the capture nor known to be beyond excluding. Nil when there are none.
-  ///
-  /// The applications to keep out are a list, made when the capture started. One that opens
-  /// a window later (a notification, an app launched mid-take) is not on it yet, and its
-  /// window is in the frames until it is. This is how a frame knows.
-  func strangersOver() -> Set<pid_t>? {
-    guard
-      let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-        as? [[String: Any]]
+  /// Every window on screen that is not this app's, the desktop's and the system's included:
+  /// what the capture leaves out.
+  func othersOnScreen(_ pid: pid_t) async throws -> [SCWindow] {
+    let content = try await limited("The list of windows on screen", seconds: 3) {
+      Handed(value: try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true))
+    }
+    return content.windows.filter { $0.owningApplication?.processID != pid }
+  }
+
+  /// The windows of anything else that overlap this one right now, as the window server has
+  /// them. Nil when this window is not on screen.
+  func windowsOver() -> Set<CGWindowID>? {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
     else { return nil }
     var mine: CGRect?
-    var others: [(pid_t, CGRect)] = []
+    var others: [(CGWindowID, CGRect)] = []
     for info in list {
-      guard let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+      guard let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
         let b = info[kCGWindowBounds as String] as? [String: Any],
         let bounds = CGRect(dictionaryRepresentation: b as CFDictionary)
       else { continue }
-      if (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID {
+      if id == windowID {
         mine = bounds
-      } else if pid != appPID, ((info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0 {
-        others.append((pid, bounds))
+      } else if (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value != appPID,
+        ((info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0
+      {
+        others.append((id, bounds))
       }
     }
     guard let rect = mine else { return nil }
-    let (out, beyond) = locked(exLock) { (excluded, ignored) }
-    var found = Set<pid_t>()
-    for (pid, bounds) in others where !out.contains(pid) && !beyond.contains(pid) && bounds.intersects(rect) {
-      found.insert(pid)
-    }
-    return found.isEmpty ? nil : found
+    return Set(others.filter { $0.1.intersects(rect) }.map { $0.0 })
   }
 
-  /// Asks for these owners to be kept out, and holds frames until they are.
-  func exclude(_ strangers: Set<pid_t>) {
+  /// The windows over this one right now that are neither excluded from the capture nor
+  /// known to be beyond excluding. Nil when there are none.
+  ///
+  /// The windows to keep out are a list, made when the capture started. One that opens later
+  /// (a notification, an app launched mid-take) is not on it yet, and it is in the frames
+  /// until it is. This is how a frame knows.
+  func strangersOver() -> Set<CGWindowID>? {
+    guard let over = windowsOver() else { return nil }
+    let known = locked(exLock) { excluded.union(ignored) }
+    let strangers = over.subtracting(known)
+    return strangers.isEmpty ? nil : strangers
+  }
+
+  /// Asks for these windows to be kept out, and holds frames until they are.
+  func exclude(_ strangers: Set<CGWindowID>) {
     let now = CACurrentMediaTime()
     locked(exLock) {
-      for pid in strangers where unsettled[pid] == nil { unsettled[pid] = now }
+      for id in strangers where unsettled[id] == nil { unsettled[id] = now }
     }
     watchQ.async { self.refreshExclusions() }
   }
 
-  /// Brings the capture's list of excluded applications up to date, then settles every
-  /// owner that was asked about: excluded now, or beyond excluding and let through.
+  /// Brings the capture's list of excluded windows up to date, then settles every window
+  /// that was asked about: excluded now, or beyond excluding and let through.
   func refreshExclusions() {
     guard !refreshing, !finished, let s = stream else { return }
     let asked = locked(exLock) { unsettled }
     guard !asked.isEmpty else { return }
     refreshing = true
     Task {
-      var now: Set<pid_t>?
-      if let content = try? await limited("The list of running applications", seconds: 3, {
-        Handed(value: try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true))
+      var now: Set<CGWindowID>?
+      if let content = try? await limited("The list of windows on screen", seconds: 3, {
+        Handed(value: try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true))
       }), let display = content.displays.first(where: { $0.displayID == self.displayID }) {
-        let others = content.applications.filter { $0.processID != self.appPID }
-        let filter = SCContentFilter(display: display, excludingApplications: others, exceptingWindows: [])
-        let updated: Void? = try? await limited("Keeping other applications out of the capture", seconds: 3) {
+        let others = content.windows.filter { $0.owningApplication?.processID != self.appPID }
+        let filter = SCContentFilter(display: display, excludingWindows: others)
+        let updated: Void? = try? await limited("Keeping other windows out of the capture", seconds: 3) {
           try await s.updateContentFilter(filter)
           return Handed(value: ())
         }
-        if updated != nil { now = Set(others.map { $0.processID }) }
+        if updated != nil { now = Set(others.map { $0.windowID }) }
       }
       let applied = now
       let since = CACurrentMediaTime()
       self.watchQ.async {
-        let beyond: Set<pid_t> = locked(self.exLock) {
+        let beyond: Set<CGWindowID> = locked(self.exLock) {
           if let applied {
             self.excluded = applied
             // Frames taken before now were taken under the old list.
             self.cleanFrom = since
           }
-          var given = Set<pid_t>()
-          for (pid, firstSeen) in asked {
-            if self.excluded.contains(pid) {
-              self.unsettled[pid] = nil
+          var given = Set<CGWindowID>()
+          for (id, firstSeen) in asked {
+            if self.excluded.contains(id) {
+              self.unsettled[id] = nil
             } else if since - firstSeen >= STRANGER_SECONDS {
-              // Still not on the system's list of applications after this long: it will not
-              // be, and holding frames for it would hold them for good. It is let through.
-              self.unsettled[pid] = nil
-              self.ignored.insert(pid)
-              given.insert(pid)
+              // Still not offered for capture after this long: it will not be, and holding
+              // frames for it would hold them for good. It is let through.
+              self.unsettled[id] = nil
+              self.ignored.insert(id)
+              given.insert(id)
             }
-            // Otherwise it stays unsettled: an application that has only just opened its
-            // window may not be on the list yet. Frames stay held and the next one asks again.
+            // Otherwise it stays unsettled: a window that has only just opened may not be
+            // on the list yet. Frames stay held and the next one asks again.
           }
           return given
         }
@@ -746,7 +764,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
           emit([
             "event": "notice", "code": "not-excludable",
             "message":
-              "A window over this one could not be kept out of the capture: the system does not list its owner as an application.",
+              "A window over this one could not be kept out of the capture: the system does not offer it for exclusion.",
           ])
         }
         self.refreshing = false

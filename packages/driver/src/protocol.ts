@@ -21,8 +21,8 @@ export interface Rect {
 /**
  * How the window is scoped.
  *
- * `others-out` (the default) is the display with every other application excluded,
- * cropped to the window. The rest name the window or its app, and on macOS 26 that makes
+ * `others-out` (the default) is the display with every window that is not the app's
+ * excluded, cropped to the window. The rest name the window or its app, and on macOS 26 that makes
  * the system draw its sharing control over the window's traffic lights, where it lands
  * in the pixels. They are kept for measuring other macOS versions.
  */
@@ -138,10 +138,10 @@ export interface StoppedEvent {
   resized: boolean
   /** Times the capture was moved to stay on the window. */
   sourceUpdates: number
-  /** Times the list of excluded applications was brought up to date. */
+  /** Times the list of excluded windows was brought up to date. */
   filterRefreshes: number
   /**
-   * Frames held back because another application's window was over this one and not yet
+   * Frames held back because a window of something else was over this one and not yet
    * excluded. They are not in the file: the picture keeps its last clean frame.
    */
   heldFrames: number
