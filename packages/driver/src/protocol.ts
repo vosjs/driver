@@ -151,7 +151,7 @@ export type HelperErrorCode =
   | 'screen-recording'
   /** No window on screen matches the request. */
   | 'no-window'
-  /** The capture could not start. */
+  /** The capture could not start, or the system did not answer in time. */
   | 'start-failed'
   /** The take ended before the window produced a frame. */
   | 'no-frames'

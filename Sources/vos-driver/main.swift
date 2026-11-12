@@ -69,6 +69,56 @@ func fail(_ code: String, _ message: String) -> Never {
 }
 func r1(_ v: Double) -> Double { (v * 10).rounded() / 10 }
 
+// MARK: time limits
+
+/// A system call that did not answer in time.
+struct TimedOut: Error, LocalizedError {
+  let what: String
+  let seconds: Double
+  var errorDescription: String? { "\(what) did not answer within \(Int(seconds)) s." }
+}
+
+/// How long the system may take to list windows, and to start or stop a capture.
+let SYSTEM_SECONDS = 10.0
+
+/// A value crossing from the task that made it to the one waiting for it.
+struct Handed<T>: @unchecked Sendable { let value: T }
+
+/// The first of two outcomes wins; the other is dropped.
+final class Once: @unchecked Sendable {
+  private let lock = NSLock()
+  private var taken = false
+  func claim() -> Bool {
+    locked(lock) {
+      if taken { return false }
+      taken = true
+      return true
+    }
+  }
+}
+
+/// Runs a system call with a limit. ScreenCaptureKit's calls can stall and do not hear a
+/// cancellation, so this does not wait for the stalled one: it answers `TimedOut` and leaves
+/// it behind. The helper exits soon after, which ends it.
+func limited<T>(
+  _ what: String, seconds: Double = SYSTEM_SECONDS, _ call: @escaping @Sendable () async throws -> Handed<T>
+) async throws -> T {
+  try await withCheckedThrowingContinuation { (c: CheckedContinuation<Handed<T>, Error>) in
+    let once = Once()
+    Task {
+      do {
+        let value = try await call()
+        if once.claim() { c.resume(returning: value) }
+      } catch {
+        if once.claim() { c.resume(throwing: error) }
+      }
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+      if once.claim() { c.resume(throwing: TimedOut(what: what, seconds: seconds)) }
+    }
+  }.value
+}
+
 // MARK: geometry
 
 /// A window's frame in global points, top-left origin (the space CGEvent.location speaks).
@@ -273,7 +323,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
 
     let s = SCStream(filter: filter, configuration: config, delegate: self)
     try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQ)
-    try await s.startCapture()
+    try await limited("The start of the capture") {
+      try await s.startCapture()
+      return Handed(value: ())
+    }
     stream = s
 
     // `ready` is said when the first frame is in the file (see the frame handler): only then
@@ -426,7 +479,17 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   func stop(reason: String) async {
     guard claimStop() else { return }
     timer?.cancel()
-    try? await stream?.stopCapture()
+    // A capture that will not stop must not keep the take from being written.
+    if let s = stream {
+      do {
+        try await limited("The end of the capture") {
+          try await s.stopCapture()
+          return Handed(value: ())
+        }
+      } catch let late as TimedOut {
+        emit(["event": "notice", "code": "slow-stop", "message": late.localizedDescription])
+      } catch {}
+    }
     videoQ.sync {}
 
     // No frame ever arrived: there is no take, and the writer has no session to finish.
@@ -509,7 +572,11 @@ func cmdCheck() {
 
 func shareable() async -> SCShareableContent {
   do {
-    return try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+    return try await limited("The list of the screen's windows") {
+      Handed(value: try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true))
+    }
+  } catch let late as TimedOut {
+    fail("start-failed", late.localizedDescription)
   } catch {
     fail(
       "screen-recording",

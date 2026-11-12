@@ -25,6 +25,9 @@ jobs:
           - os: macos-15-intel
             node: 22
     runs-on: ${{ matrix.os }}
+    # The whole gate takes two minutes. A run that is still going at fifteen is stuck,
+    # and a stuck run says so here, not at the six-hour default.
+    timeout-minutes: 15
     steps:
       # Every action is pinned to a commit, with its version beside it;
       # Dependabot moves the pins (.github/dependabot.yml). A floating tag
