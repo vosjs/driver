@@ -58,7 +58,7 @@ glide(from: a, to: b, ms: 700)
 usleep(150_000)
 click(b)
 usleep(600_000)
-for code: CGKeyCode in [49, 4, 34, 47] {  // space h i .
+for code: CGKeyCode in [49, 4, 14, 37, 37, 31, 49, 9, 31, 1, 47] {  // " hello vos."
   key(code)
   usleep(140_000)
 }

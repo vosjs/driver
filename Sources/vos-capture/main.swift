@@ -81,12 +81,31 @@ func elementRect(at p: CGPoint) -> CGRect? {
   else { return nil }
   return axRect(e)
 }
-func focusedRect() -> CGRect? {
+func focusedElement() -> AXUIElement? {
   var el: CFTypeRef?
   guard AXUIElementCopyAttributeValue(axSystem, kAXFocusedUIElementAttribute as CFString, &el) == .success,
     let e = el
   else { return nil }
-  return axRect(e as! AXUIElement)
+  return (e as! AXUIElement)
+}
+func focusedRect() -> CGRect? { focusedElement().flatMap(axRect) }
+/// Where the insertion point is, in global points: the bounds of the focused element's selection.
+/// A position only. The text itself is never read.
+func caretRect() -> CGRect? {
+  guard let e = focusedElement() else { return nil }
+  var range: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(e, kAXSelectedTextRangeAttribute as CFString, &range) == .success,
+    let r = range
+  else { return nil }
+  var bounds: CFTypeRef?
+  guard
+    AXUIElementCopyParameterizedAttributeValue(
+      e, kAXBoundsForRangeParameterizedAttribute as CFString, r, &bounds) == .success,
+    let bv = bounds
+  else { return nil }
+  var rect = CGRect.zero
+  guard AXValueGetValue(bv as! AXValue, .cgRect, &rect), rect.height > 0 else { return nil }
+  return rect
 }
 
 // MARK: recorder
@@ -339,7 +358,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
       if t - lastKeyPing >= 350, NSWorkspace.shared.frontmostApplication?.localizedName == appName {
         lastKeyPing = t
         if wantFrames, let r = focusedRect(), win.intersects(r) {
-          push("key", t, CGPoint(x: r.midX, y: r.midY), rect: r, origin: origin)
+          // A field names itself. An element that fills the window (an editor, a canvas) says
+          // nothing about WHERE the typing is: there the ping sits at the insertion point.
+          let fills = r.width * r.height > 0.5 * win.width * win.height
+          if fills, let c = caretRect(), win.intersects(c) {
+            push("key", t, CGPoint(x: c.midX, y: c.midY), origin: origin)
+          } else {
+            push("key", t, CGPoint(x: r.midX, y: r.midY), rect: fills ? nil : r, origin: origin)
+          }
         } else if inside {
           push("key", t, pos, origin: origin)
         }
