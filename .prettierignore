@@ -1,0 +1,9 @@
+node_modules
+dist
+build
+pnpm-lock.yaml
+*.d.ts
+# The built helper
+packages/driver-darwin/bin
+# A copy of the root README, present only while packing
+packages/driver/README.md

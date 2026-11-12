@@ -1,0 +1,5 @@
+packages:
+  - 'packages/*'
+
+# No dependency may run an install script (pnpm.io/settings): every one is files.
+onlyBuiltDependencies: []
