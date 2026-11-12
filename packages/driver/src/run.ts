@@ -6,12 +6,19 @@ import {
   PROTOCOL_VERSION,
   type CheckEvent,
   type CheckResult,
+  type Command,
+  type CommandResult,
   type DriverEvent,
   type DriverWindow,
   type ReadyEvent,
   type RecordRequest,
+  type StillEvent,
+  type StillResult,
   type StoppedEvent,
+  type TreeEvent,
+  type TreeResult,
   type WindowEvent,
+  type WindowRequest,
 } from './protocol.js'
 
 /** How much of the helper's stderr is kept to explain a crash. */
@@ -142,6 +149,32 @@ export async function windows(): Promise<DriverWindow[]> {
     .map((w) => ({ id: w.id, app: w.app, appId: w.appId, titled: w.titled, frame: w.frame }))
 }
 
+/**
+ * The outline of an app's window: each element a script can name, with a selector for it.
+ * Needs Accessibility. What a person typed into a field is never read.
+ *
+ * @throws {DriverError} `accessibility` when it is not granted, `no-window`, `no-tree`.
+ */
+export async function tree(request: WindowRequest): Promise<TreeResult> {
+  const events = await collect(['tree', JSON.stringify(request)])
+  const found = events.find((e): e is TreeEvent => e.event === 'tree')
+  if (!found) throw new DriverError('crashed', 'The helper answered `tree` with nothing.')
+  return { app: found.app, window: found.window, elements: found.elements }
+}
+
+/**
+ * One picture of an app's window, as a take would show it: a PNG at the window's pixel
+ * size, with no pointer and nothing of any other app. Needs Screen Recording.
+ */
+export async function still(request: WindowRequest & { out: string }): Promise<StillResult> {
+  const wire = { ...request, out: resolvePath(request.out) }
+  const events = await collect(['still', JSON.stringify(wire)])
+  const found = events.find((e): e is StillEvent => e.event === 'still')
+  if (!found) throw new DriverError('crashed', 'The helper answered `still` with nothing.')
+  const { event: _event, ...result } = found
+  return result
+}
+
 export interface RecordOptions {
   /** Every line the helper prints, as it arrives. */
   onEvent?: (event: DriverEvent) => void
@@ -165,6 +198,15 @@ export interface Recording {
   readonly done: Promise<StoppedEvent>
   /** Ends the take; resolves as `done` does. Calling it again is the same stop. */
   stop(): Promise<StoppedEvent>
+  /**
+   * Does one act of a script and resolves with its answer. Commands run one at a time, in
+   * the order sent. A command that did nothing (`not-found`, a disabled control) resolves
+   * with `ok: false` or `pressed: false`: the script decides what that means. It rejects
+   * only when the take ended before the command was answered.
+   *
+   * The take is recorded with `drive: true`, and commands belong after `ready`.
+   */
+  send(command: Command): Promise<CommandResult>
 }
 
 /**
@@ -203,7 +245,7 @@ export function record(request: RecordRequest, options: RecordOptions = {}): Rec
     const failure = spawnFailure(error)
     rejectReady(failure)
     rejectDone(failure)
-    return { pid: undefined, ready, done, stop: () => done }
+    return { pid: undefined, ready, done, stop: () => done, send: () => Promise.reject(failure) }
   }
 
   let isReady = false
@@ -212,6 +254,24 @@ export function record(request: RecordRequest, options: RecordOptions = {}): Rec
   let stderr = ''
   let asked = false
   let finished = false
+  let nextId = 0
+  const waiting = new Map<
+    number,
+    { resolve: (r: CommandResult) => void; reject: (e: DriverError) => void }
+  >()
+
+  const send = (command: Command): Promise<CommandResult> => {
+    if (finished || asked || !child.stdin?.writable) {
+      return Promise.reject(
+        new DriverError('crashed', 'The take has ended: it takes no more commands.'),
+      )
+    }
+    const id = ++nextId
+    return new Promise<CommandResult>((resolve, reject) => {
+      waiting.set(id, { resolve, reject })
+      child.stdin!.write(JSON.stringify({ id, ...command }) + '\n')
+    })
+  }
 
   const stop = (): Promise<StoppedEvent> => {
     if (!asked && child.stdin?.writable) {
@@ -224,6 +284,12 @@ export function record(request: RecordRequest, options: RecordOptions = {}): Rec
   const finish = () => {
     if (finished) return
     finished = true
+    for (const { reject } of waiting.values()) {
+      reject(
+        failure ?? new DriverError('crashed', 'The take ended before the command was answered.'),
+      )
+    }
+    waiting.clear()
     if (failure) {
       if (!isReady) rejectReady(failure)
       rejectDone(failure)
@@ -240,6 +306,12 @@ export function record(request: RecordRequest, options: RecordOptions = {}): Rec
       } else {
         isReady = true
         resolveReady(event)
+      }
+    } else if (event.event === 'result') {
+      const { event: _event, id, ...result } = event
+      if (id !== undefined) {
+        waiting.get(id)?.resolve(result as CommandResult)
+        waiting.delete(id)
       }
     } else if (event.event === 'stopped') {
       stopped = event
@@ -284,5 +356,6 @@ export function record(request: RecordRequest, options: RecordOptions = {}): Rec
     ready,
     done,
     stop,
+    send,
   }
 }

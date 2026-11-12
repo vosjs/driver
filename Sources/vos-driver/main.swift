@@ -4,6 +4,8 @@
 //   vos-driver version               the helper's version and protocol, as JSON
 //   vos-driver check                 permissions, as JSON (run from a fresh process: the answer is cached)
 //   vos-driver windows               windows that can be recorded, one JSON object per line
+//   vos-driver tree '<json>'         the outline of an app's window: what a script can name
+//   vos-driver still '<json>'        one picture of the window, as a take would show it
 //   vos-driver record '<json>'       record one window; JSON lines on stdout: `ready` once the
 //                                    first frame is in the file, then `stopped` or `error`
 //
@@ -16,6 +18,9 @@
 //     "maxSeconds": 3600,      a safety ceiling; pass your own
 //     "pointer": true,         sample the real pointer (a performed take)
 //     "frames": false,         read the bounds of what was pressed (needs Accessibility)
+//     "drive": false,          a scripted take: bring the app forward, and take commands on
+//                              stdin (Script.swift). Needs Accessibility.
+//     "size": {"w":1200,"h":800},   give the window this size before the capture
 //     "filter": "others-out" } how the window is scoped; see FILTERS
 //
 // A take ends on `stop` and a newline on stdin, on SIGINT or SIGTERM, at maxSeconds, when the
@@ -318,6 +323,20 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   var lastDown = false
   var lastKeyCount: UInt32 = 0
   var lastKeyPing = -1.0
+  /// The bounds of what a script is about to press, in global points. The next press in the
+  /// track carries them: the element the script named, not whatever a hit test finds there.
+  private var pressRectValue: CGRect?
+  var pressRect: CGRect? {
+    get { locked(evLock) { pressRectValue } }
+    set { locked(evLock) { pressRectValue = newValue } }
+  }
+  func takePressRect() -> CGRect? {
+    locked(evLock) {
+      let r = pressRectValue
+      pressRectValue = nil
+      return r
+    }
+  }
 
   let stopLock = NSLock()
   var finished = false
@@ -806,7 +825,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     if down != lastDown {
       lastDown = down
       if inside {
-        let rect = (wantFrames && down) ? elementRect(at: pos) : nil
+        let rect = down ? (takePressRect() ?? (wantFrames ? elementRect(at: pos) : nil)) : nil
         push(down ? "down" : "up", t, pos, rect: rect, origin: origin)
       }
     }
@@ -1038,22 +1057,40 @@ func cmdRecord(_ json: String) async {
     exit(1)
   }
 
+  // A scripted take acts on the app, which is Accessibility's to allow. Said before anything
+  // is recorded, not at the first step.
+  let drives = req["drive"] as? Bool ?? false
+  if drives, !AXIsProcessTrusted() { fail("accessibility", ACCESSIBILITY_NEEDED) }
+
   progress.at("listing the screen's windows")
-  let content = await shareable()
-  let candidates = recordable(content)
-  var window: SCWindow?
-  if let id = req["window"] as? Int {
-    window = candidates.first { Int($0.windowID) == id }
-  } else if let app = req["app"] as? String {
-    let match = candidates.filter {
-      $0.owningApplication?.applicationName == app || $0.owningApplication?.bundleIdentifier == app
-    }
-    // An app's alert is an untitled window of its own: the app's window is a titled one first.
-    let named = match.filter(titled)
-    let pool = named.isEmpty ? match : named
-    window = pool.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+  var content = await shareable()
+  guard var w = requestedWindow(req, content) else {
+    fail("no-window", "No window on screen matches the request.")
   }
-  guard let w = window else { fail("no-window", "No window on screen matches the request.") }
+  let pid = w.owningApplication?.processID ?? 0
+
+  // The window at the size the script asks for, before the capture: a take is one size.
+  if let size = req["size"] as? [String: Any], let sw = (size["w"] as? NSNumber)?.doubleValue,
+    let sh = (size["h"] as? NSNumber)?.doubleValue
+  {
+    guard AXIsProcessTrusted() else { fail("accessibility", ACCESSIBILITY_NEEDED) }
+    progress.at("sizing the window")
+    guard resizeWindow(pid: pid, frame: w.frame, to: CGSize(width: sw, height: sh)) else {
+      fail("start-failed", "The window could not be given the size the request asks for.")
+    }
+    content = await shareable()
+    guard let again = recordable(content).first(where: { $0.windowID == w.windowID }) else {
+      fail("no-window", "The window was gone after it was sized.")
+    }
+    w = again
+  }
+  if drives {
+    progress.at("bringing the app to the front")
+    guard bringForward(pid: pid, window: windowElement(pid, frame: w.frame)) else {
+      fail("start-failed", "The app could not be brought to the front, so a script's input would go to another one.")
+    }
+    usleep(250_000)
+  }
 
   let rec = Recorder(
     windowID: w.windowID, outDir: URL(fileURLWithPath: out), fps: fps, bitrate: bitrate,
@@ -1068,12 +1105,23 @@ func cmdRecord(_ json: String) async {
   DispatchQueue.global().asyncAfter(deadline: .now() + maxSeconds) { Task { await rec.stop(reason: "cap") } }
 
   let parentHoldsStdin = stdinIsPipe()
+  let driver = Driver(rec: rec, pid: pid, windowID: w.windowID)
   Thread.detachNewThread {
     while let line = readLine() {
-      if line.trimmingCharacters(in: .whitespaces) == "stop" {
+      let text = line.trimmingCharacters(in: .whitespaces)
+      if text == "stop" {
         Task { await rec.stop(reason: "stop") }
         return
       }
+      // Anything else is one command of a script, run and answered before the next is read.
+      guard !text.isEmpty else { continue }
+      guard let data = text.data(using: .utf8),
+        let cmd = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+      else {
+        emit(["event": "result", "ok": false, "code": "bad-request", "message": "A line on stdin is `stop` or one JSON command."])
+        continue
+      }
+      emit(driver.run(cmd))
     }
     // End of input. On a pipe, whatever started this is gone, and a recorder never outlives it.
     if parentHoldsStdin { Task { await rec.stop(reason: "parent-gone") } }
@@ -1098,7 +1146,87 @@ func cmdRecord(_ json: String) async {
   exit(rec.exitCode)
 }
 
-let USAGE = "usage: vos-driver version | check | windows | record '<json>'\n"
+/// The window a request names: by its id, or the app's largest titled one.
+func requestedWindow(_ req: [String: Any], _ content: SCShareableContent) -> SCWindow? {
+  let candidates = recordable(content)
+  if let id = req["window"] as? Int { return candidates.first { Int($0.windowID) == id } }
+  guard let app = req["app"] as? String else { return nil }
+  let match = candidates.filter {
+    $0.owningApplication?.applicationName == app || $0.owningApplication?.bundleIdentifier == app
+  }
+  // An app's alert is an untitled window of its own: the app's window is a titled one first.
+  let named = match.filter(titled)
+  let pool = named.isEmpty ? match : named
+  return pool.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+}
+
+/// Gives the window a size, keeping its top-left corner where it is, and waits for it to take.
+func resizeWindow(pid: pid_t, frame: CGRect, to size: CGSize) -> Bool {
+  guard let window = windowElement(pid, frame: frame) else { return false }
+  var wanted = size
+  guard let value = AXValueCreate(.cgSize, &wanted),
+    AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value) == .success
+  else { return false }
+  let deadline = CACurrentMediaTime() + 2
+  while CACurrentMediaTime() < deadline {
+    if let now = axRect(window), abs(now.width - size.width) < 2, abs(now.height - size.height) < 2 {
+      usleep(250_000)  // the window server's own record of it follows
+      return true
+    }
+    usleep(50_000)
+  }
+  // An app may refuse a size (its minimum, its screen). What it took is what the take is.
+  return axRect(window) != nil
+}
+
+/// `still`: one picture of the window, as a take would show it, for someone about to script it.
+func cmdStill(_ json: String) async {
+  guard let data = json.data(using: .utf8),
+    let req = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+  else { fail("bad-request", "The still request is not a JSON object.") }
+  guard let out = req["out"] as? String, !out.isEmpty else {
+    fail("bad-request", "The request names no out file.")
+  }
+  let content = await shareable()
+  guard let w = requestedWindow(req, content), let app = w.owningApplication,
+    let display = content.displays.first(where: { $0.frame.intersects(w.frame) }) ?? content.displays.first
+  else { fail("no-window", "No window on screen matches the request.") }
+  do {
+    let all = try await limited("The list of windows on screen", seconds: 3) {
+      Handed(value: try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true))
+    }
+    let others = all.windows.filter { $0.owningApplication?.processID != app.processID }
+    let filter = SCContentFilter(display: display, excludingWindows: others)
+    let scale = Double(filter.pointPixelScale)
+    let config = SCStreamConfiguration()
+    config.sourceRect = CGRect(
+      x: w.frame.minX - display.frame.minX, y: w.frame.minY - display.frame.minY, width: w.frame.width,
+      height: w.frame.height)
+    config.width = Int((w.frame.width * scale).rounded())
+    config.height = Int((w.frame.height * scale).rounded())
+    config.showsCursor = false
+    let image = try await limited("The picture of the window") {
+      Handed(value: try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config))
+    }
+    guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+      fail("write-failed", "The picture could not be made into a PNG.")
+    }
+    let url = URL(fileURLWithPath: out)
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try png.write(to: url)
+    emit([
+      "event": "still", "out": url.path, "app": app.applicationName, "window": Int(w.windowID),
+      "width": image.width, "height": image.height, "scale": scale,
+      "frame": ["x": w.frame.minX, "y": w.frame.minY, "w": w.frame.width, "h": w.frame.height],
+    ])
+  } catch let late as TimedOut {
+    fail("start-failed", late.localizedDescription)
+  } catch {
+    fail("write-failed", "The picture could not be taken: \(error.localizedDescription)")
+  }
+}
+
+let USAGE = "usage: vos-driver version | check | windows | tree '<json>' | still '<json>' | record '<json>'\n"
 
 @main
 struct Main {
@@ -1113,6 +1241,8 @@ struct Main {
     switch verb {
     case "check": cmdCheck()
     case "windows": await cmdWindows()
+    case "tree": cmdTree(args.count > 2 ? args[2] : "")
+    case "still": await cmdStill(args.count > 2 ? args[2] : "")
     case "record": await cmdRecord(args.count > 2 ? args[2] : "")
     default:
       FileHandle.standardError.write(USAGE.data(using: .utf8)!)

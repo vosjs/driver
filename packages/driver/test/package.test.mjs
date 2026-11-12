@@ -120,7 +120,10 @@ describe('the helper', { skip: macOnly }, () => {
   it('prints its usage and exits 2 on a verb it does not know', () => {
     const run = spawnSync(driverPath(), ['frobnicate'], { encoding: 'utf8' })
     assert.equal(run.status, 2)
-    assert.match(run.stderr, /^usage: vos-driver version \| check \| windows \| record/)
+    assert.match(
+      run.stderr,
+      /^usage: vos-driver version \| check \| windows \| tree '<json>' \| still '<json>' \| record/,
+    )
     assert.equal(run.stdout, '')
   })
 

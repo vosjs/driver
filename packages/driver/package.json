@@ -1,6 +1,6 @@
 {
   "name": "@vosjs/driver",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Records a desktop app's window for a vos take: a headless helper with no pointer in the pixels and the pointer's path beside the video, behind a small typed API.",
   "type": "module",
   "license": "MIT",
@@ -48,7 +48,7 @@
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "prepack": "node ../../scripts/check-dist.mjs",
     "postpack": "rm -f README.md"
   },

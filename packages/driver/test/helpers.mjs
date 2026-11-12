@@ -143,7 +143,7 @@ function builtTools() {
 
 /**
  * Shows a fixture window (Fixtures/window.swift): titled, one flat colour, with a moving
- * bar, owned by a process of ours. Resolves once it is on screen.
+ * bar and a few real controls, owned by a process of ours. Resolves once it is on screen.
  *
  * `move(dx, dy)` moves it by that many points, right and down.
  */
@@ -190,6 +190,11 @@ export async function openFixture({ color, title } = {}) {
     async move(dx, dy) {
       child.stdin.write(`move ${dx} ${dy}\n`)
       await next('moved')
+    },
+    /** What was done to its controls: `{ clicks, typed, remember, again }`. */
+    async state() {
+      child.stdin.write('state\n')
+      return next('clicks')
     },
     close() {
       child.stdin.end()
