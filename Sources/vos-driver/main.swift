@@ -39,8 +39,8 @@ import ScreenCaptureKit
 /// The wire protocol's version. It moves when a request field or an event changes meaning.
 let PROTOCOL = 1
 
-/// How the window is scoped. `others-out` is the display with every OTHER application excluded,
-/// cropped to the window: scope by exclusion. The rest name the window or its app, and on
+/// How the window is scoped. `others-out` is the display with every window that is not the
+/// app's excluded, cropped to the window: scope by exclusion. The rest name the window or its app, and on
 /// macOS 26 that makes the system draw its sharing control over the window's traffic lights,
 /// where it lands in the pixels. They are kept for measuring other macOS versions.
 let FILTERS = ["others-out", "window", "app", "display-window", "display"]
@@ -54,6 +54,15 @@ let DRAIN_SECONDS = 5.0
 /// How long a take may take to begin, from the request to the first frame in the file. Past
 /// it the helper says where it was and leaves: it never waits for good, whatever stalled.
 let BEGIN_SECONDS = 20.0
+
+/// How long frames are held for a window the system's list does not have yet. A window that
+/// has just opened takes a moment to be listed; one that is still not listed after this is
+/// not going to be.
+let STRANGER_SECONDS = 2.0
+
+/// No window's corners are rounder than this. A corner that reads rounder is a window that
+/// is black where it meets the black outside it, and says nothing about its shape.
+let CORNER_CEILING_POINTS = 40.0
 
 // MARK: output
 
@@ -75,6 +84,13 @@ func fail(_ code: String, _ message: String) -> Never {
   exit(1)
 }
 func r1(_ v: Double) -> Double { (v * 10).rounded() / 10 }
+
+/// True when everything already on the queue has run within the time given.
+func drains(_ queue: DispatchQueue, within seconds: Double) -> Bool {
+  let drained = DispatchSemaphore(value: 0)
+  queue.async { drained.signal() }
+  return drained.wait(timeout: .now() + seconds) == .success
+}
 
 // MARK: progress
 
@@ -232,6 +248,46 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
 
   var readyEvent: [String: Any] = [:]
 
+  // The capture follows the window and keeps every other application out, for the whole
+  // take. All of this is read and written on `watchQ` alone.
+  let watchQ = DispatchQueue(label: "vos.driver.window")
+  var watcher: DispatchSourceTimer?
+  let config = SCStreamConfiguration()
+  /// What the capture paints where the app is not. The configuration does not keep it alive.
+  let outside = CGColor(gray: 0, alpha: 1)
+  /// True when the capture is a rectangle of a display (it must be moved with the window).
+  var followsWindow = false
+  /// True when other applications are kept out by a list (it must be kept current).
+  var excludesOthers = false
+  var displayID: CGDirectDisplayID = 0
+  var displayOrigin: CGPoint = .zero
+  var appPID: pid_t = 0
+  /// The rectangle of the display the capture was last told to take.
+  var appliedRect: CGRect = .zero
+  var moving = false
+  var nextMoveAt = 0.0
+  var sourceUpdates = 0
+  var refreshing = false
+  var filterRefreshes = 0
+  var saidBeyond = false
+
+  // What is kept out of the picture: every window on screen that is not the app's. Read by
+  // the frame handler, written when the list is brought up to date: behind `exLock`.
+  let exLock = NSLock()
+  /// Windows the capture excludes.
+  var excluded: Set<CGWindowID> = []
+  /// Windows the capture cannot exclude (the system does not offer them for capture, so
+  /// there is nothing to exclude). They are let through: holding frames for one would hold
+  /// every frame.
+  var ignored: Set<CGWindowID> = []
+  /// Windows seen over this one and not yet excluded or ignored, with the host time each
+  /// was first seen.
+  var unsettled: [CGWindowID: Double] = [:]
+  /// Frames taken before this host time may still show a window excluded since.
+  var cleanFrom = 0.0
+  /// Frames held back because another application's window was over this one.
+  var held = 0
+
   // clock: zero is the first frame the file holds, on the host clock (seconds)
   var t0Host: Double?
   var t0Wall: Double = 0
@@ -251,6 +307,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   var resized = false
   var moved = false
   var firstFrame: CGRect = .zero
+  /// The radius of the window's own rounded corners, in points; 0 when it has none or it
+  /// could not be read. Outside it the recording is opaque black.
+  var cornerRadius = 0.0
 
   // track
   var events: [[String: Any]] = []
@@ -285,7 +344,6 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   func start(content: SCShareableContent, window: SCWindow, filterKind: String) async throws {
     progress.at("scoping the capture to the window")
     let filter: SCContentFilter
-    let config = SCStreamConfiguration()
     let frame = window.frame
     firstFrame = frame
     if filterKind != "window", let app = window.owningApplication,
@@ -296,13 +354,25 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       case "display": filter = SCContentFilter(display: display, excludingWindows: [])
       case "app": filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
       default:
-        // others-out: the display with every OTHER application excluded
-        let others = content.applications.filter { $0.processID != app.processID }
-        filter = SCContentFilter(display: display, excludingApplications: others, exceptingWindows: [])
+        // others-out: the display with every window that is not the app's excluded, the
+        // desktop's and the system's among them.
+        let others = try await othersOnScreen(app.processID)
+        filter = SCContentFilter(display: display, excludingWindows: others)
+        excludesOthers = true
+        excluded = Set(others.map { $0.windowID })
       }
-      config.sourceRect = CGRect(
+      // A rectangle of the display, where the window is now. It does not move by itself.
+      followsWindow = true
+      displayID = display.displayID
+      displayOrigin = display.frame.origin
+      appPID = app.processID
+      // What is over the window now and cannot be excluded is known from the start, so a
+      // take does not open by waiting on it.
+      if excludesOthers { ignored = (windowsOver() ?? []).subtracting(excluded) }
+      appliedRect = CGRect(
         x: frame.minX - display.frame.minX, y: frame.minY - display.frame.minY, width: frame.width,
         height: frame.height)
+      config.sourceRect = appliedRect
     } else {
       filter = SCContentFilter(desktopIndependentWindow: window)
     }
@@ -326,6 +396,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     config.queueDepth = 6
     config.capturesAudio = false
     config.scalesToFit = true
+    // What is not the app is black: the window's own shape is read from that
+    // (see cornerRadiusPoints), and the file has no alpha to say it another way.
+    config.backgroundColor = outside
 
     progress.at("opening the recording file")
     try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
@@ -375,6 +448,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       return Handed(value: ())
     }
     progress.at("waiting for the window's first frame to reach the file")
+    startWatching()
 
     // A take with no frame in its file would leave the caller waiting on `ready` for good:
     // a window that never draws, or frames the writer will not take.
@@ -399,6 +473,19 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     arrived += 1
     let pts = CMSampleBufferGetPresentationTimeStamp(sb).seconds
     let now = CACurrentMediaTime()
+    // Another application's window over this one is not in the take, not for one frame: a
+    // frame that may show one is held back, and the picture keeps its last clean frame.
+    if excludesOthers {
+      if let strangers = strangersOver() {
+        held += 1
+        exclude(strangers)
+        return
+      }
+      if pts < locked(exLock, { cleanFrom }) {
+        held += 1
+        return
+      }
+    }
     let lag = now - pts
     arrivalLagSum += lag
     arrivalLagMax = max(arrivalLagMax, lag)
@@ -431,6 +518,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       lastPTS = rel
       if frames == 1 {
         progress.begin()
+        cornerRadius = cornerRadiusPoints(sb)
+        readyEvent["cornerRadius"] = r1(cornerRadius)
         emit(readyEvent)
         if wantPointer { startPointer() }
       }
@@ -444,7 +533,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   /// What became of the frames, for an error that has to explain a take with none.
   var frameAccount: String {
     var text =
-      "\(arrived) arrived, \(frames) written, \(dropped) refused, \(idle) unchanged; writer state \(writer.status.rawValue)"
+      "\(arrived) arrived, \(frames) written, \(dropped) refused, \(held) held back, \(idle) unchanged; writer state \(writer.status.rawValue)"
     if let error = writer.error { text += "; the writer said: \(error)" }
     return text
   }
@@ -452,6 +541,235 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   func stream(_ stream: SCStream, didStopWithError error: Error) {
     emit(["event": "notice", "code": "stream-stopped", "message": error.localizedDescription])
     Task { await self.stop(reason: "stream-stopped") }
+  }
+
+  // MARK: the window, for the length of the take
+
+  /// How round a frame around this window must be, read from a frame of it: the radius of
+  /// the smallest circular corner that covers ALL the black outside the window's own corners.
+  ///
+  /// A window's corner is not a circle (macOS draws a continuous curve), and its edge is
+  /// anti-aliased against the black, so its extent along one edge says too little: a circle
+  /// that only reaches that far leaves a sliver of black showing. At each corner this takes
+  /// the black that is connected to the corner pixel, and for every pixel of it the radius a
+  /// circle tangent to both edges needs to leave that pixel outside.
+  ///
+  /// A corner whose black runs on past any window's roundness is a window that is itself
+  /// black there: it says nothing about its shape and is left out, and what is black against
+  /// black needs no rounding. 0 when no corner can be read, or the corners are square.
+  func cornerRadiusPoints(_ sb: CMSampleBuffer) -> Double {
+    guard followsWindow, let pb = CMSampleBufferGetImageBuffer(sb),
+      CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA
+    else { return 0 }
+    CVPixelBufferLockBaseAddress(pb, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pb) else { return 0 }
+    let w = CVPixelBufferGetWidth(pb)
+    let h = CVPixelBufferGetHeight(pb)
+    let stride = CVPixelBufferGetBytesPerRow(pb)
+    let bytes = base.assumingMemoryBound(to: UInt8.self)
+    let pixelsPerPoint = Double(w) / max(1, Double(pointSize.width))
+    let box = Int(CORNER_CEILING_POINTS * pixelsPerPoint)
+    guard box > 1, min(w, h) > 2 * box else { return 0 }
+    /// Black to the eye: the outside, and the faint edge pixels that are mostly outside.
+    func outside(_ x: Int, _ y: Int) -> Bool {
+      let i = y * stride + x * 4
+      return bytes[i] <= 16 && bytes[i + 1] <= 16 && bytes[i + 2] <= 16
+    }
+    /// The radius one corner needs, in pixels; nil when it cannot be read. (cx, cy) is the
+    /// corner pixel and (sx, sy) points into the frame.
+    func need(_ cx: Int, _ cy: Int, _ sx: Int, _ sy: Int) -> Double? {
+      guard outside(cx, cy) else { return 0 }  // a square corner
+      var seen = [Bool](repeating: false, count: box * box)
+      var stack = [(0, 0)]
+      seen[0] = true
+      var most = 0.0
+      while let (x, y) = stack.popLast() {
+        // Black that reaches the edge of the box is not a corner's.
+        if x == box - 1 || y == box - 1 { return nil }
+        // The far corner of the pixel: the whole pixel must fall outside the circle.
+        let fx = Double(x + 1)
+        let fy = Double(y + 1)
+        most = max(most, fx + fy + (2 * fx * fy).squareRoot())
+        for (nx, ny) in [(x + 1, y), (x, y + 1), (x - 1, y), (x, y - 1)] where nx >= 0 && ny >= 0 {
+          let i = ny * box + nx
+          if !seen[i] && outside(cx + sx * nx, cy + sy * ny) {
+            seen[i] = true
+            stack.append((nx, ny))
+          }
+        }
+      }
+      return most <= Double(box) ? most : nil
+    }
+    let corners = [need(0, 0, 1, 1), need(w - 1, 0, -1, 1), need(0, h - 1, 1, -1), need(w - 1, h - 1, -1, -1)]
+    guard let most = corners.compactMap({ $0 }).max() else { return 0 }
+    return most / pixelsPerPoint
+  }
+
+  func startWatching() {
+    guard followsWindow else { return }
+    let t = DispatchSource.makeTimerSource(queue: watchQ)
+    t.schedule(deadline: .now(), repeating: .milliseconds(16), leeway: .milliseconds(2))
+    t.setEventHandler { [weak self] in self?.watch() }
+    t.resume()
+    watcher = t
+  }
+
+  /// One look at the window, sixty times a second: move the capture if the window moved.
+  func watch() {
+    guard !finished, let win = windowFrame(windowID) else { return }
+    if abs(win.width - firstFrame.width) > 1 || abs(win.height - firstFrame.height) > 1 { resized = true }
+    if abs(win.minX - firstFrame.minX) > 1 || abs(win.minY - firstFrame.minY) > 1 { moved = true }
+    follow(win, CACurrentMediaTime())
+  }
+
+  /// The capture is a rectangle of the display. When the window leaves it, the rectangle goes
+  /// with the window, so the picture stays the window's as the pointer's track does.
+  func follow(_ win: CGRect, _ now: Double) {
+    let want = CGRect(
+      x: win.minX - displayOrigin.x, y: win.minY - displayOrigin.y, width: win.width, height: win.height)
+    let same =
+      abs(want.minX - appliedRect.minX) < 0.5 && abs(want.minY - appliedRect.minY) < 0.5
+      && abs(want.width - appliedRect.width) < 0.5 && abs(want.height - appliedRect.height) < 0.5
+    guard !same, !moving, now >= nextMoveAt, let s = stream else { return }
+    moving = true
+    config.sourceRect = want
+    let config = self.config
+    Task {
+      var moved = false
+      do {
+        try await limited("Moving the capture with the window", seconds: 3) {
+          try await s.updateConfiguration(config)
+          return Handed(value: ())
+        }
+        moved = true
+      } catch {}
+      let done = moved
+      self.watchQ.async {
+        if done {
+          self.appliedRect = want
+          self.sourceUpdates += 1
+        } else {
+          // A rectangle the display cannot give (the window is leaving it): not every tick.
+          self.nextMoveAt = CACurrentMediaTime() + 0.5
+        }
+        self.moving = false
+      }
+    }
+  }
+
+  /// Every window on screen that is not this app's, the desktop's and the system's included:
+  /// what the capture leaves out.
+  func othersOnScreen(_ pid: pid_t) async throws -> [SCWindow] {
+    let content = try await limited("The list of windows on screen", seconds: 3) {
+      Handed(value: try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true))
+    }
+    return content.windows.filter { $0.owningApplication?.processID != pid }
+  }
+
+  /// The windows of anything else that overlap this one right now, as the window server has
+  /// them. Nil when this window is not on screen.
+  func windowsOver() -> Set<CGWindowID>? {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
+    else { return nil }
+    var mine: CGRect?
+    var others: [(CGWindowID, CGRect)] = []
+    for info in list {
+      guard let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+        let b = info[kCGWindowBounds as String] as? [String: Any],
+        let bounds = CGRect(dictionaryRepresentation: b as CFDictionary)
+      else { continue }
+      if id == windowID {
+        mine = bounds
+      } else if (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value != appPID,
+        ((info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0
+      {
+        others.append((id, bounds))
+      }
+    }
+    guard let rect = mine else { return nil }
+    return Set(others.filter { $0.1.intersects(rect) }.map { $0.0 })
+  }
+
+  /// The windows over this one right now that are neither excluded from the capture nor
+  /// known to be beyond excluding. Nil when there are none.
+  ///
+  /// The windows to keep out are a list, made when the capture started. One that opens later
+  /// (a notification, an app launched mid-take) is not on it yet, and it is in the frames
+  /// until it is. This is how a frame knows.
+  func strangersOver() -> Set<CGWindowID>? {
+    guard let over = windowsOver() else { return nil }
+    let known = locked(exLock) { excluded.union(ignored) }
+    let strangers = over.subtracting(known)
+    return strangers.isEmpty ? nil : strangers
+  }
+
+  /// Asks for these windows to be kept out, and holds frames until they are.
+  func exclude(_ strangers: Set<CGWindowID>) {
+    let now = CACurrentMediaTime()
+    locked(exLock) {
+      for id in strangers where unsettled[id] == nil { unsettled[id] = now }
+    }
+    watchQ.async { self.refreshExclusions() }
+  }
+
+  /// Brings the capture's list of excluded windows up to date, then settles every window
+  /// that was asked about: excluded now, or beyond excluding and let through.
+  func refreshExclusions() {
+    guard !refreshing, !finished, let s = stream else { return }
+    let asked = locked(exLock) { unsettled }
+    guard !asked.isEmpty else { return }
+    refreshing = true
+    Task {
+      var now: Set<CGWindowID>?
+      if let content = try? await limited("The list of windows on screen", seconds: 3, {
+        Handed(value: try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true))
+      }), let display = content.displays.first(where: { $0.displayID == self.displayID }) {
+        let others = content.windows.filter { $0.owningApplication?.processID != self.appPID }
+        let filter = SCContentFilter(display: display, excludingWindows: others)
+        let updated: Void? = try? await limited("Keeping other windows out of the capture", seconds: 3) {
+          try await s.updateContentFilter(filter)
+          return Handed(value: ())
+        }
+        if updated != nil { now = Set(others.map { $0.windowID }) }
+      }
+      let applied = now
+      let since = CACurrentMediaTime()
+      self.watchQ.async {
+        let beyond: Set<CGWindowID> = locked(self.exLock) {
+          if let applied {
+            self.excluded = applied
+            // Frames taken before now were taken under the old list.
+            self.cleanFrom = since
+          }
+          var given = Set<CGWindowID>()
+          for (id, firstSeen) in asked {
+            if self.excluded.contains(id) {
+              self.unsettled[id] = nil
+            } else if since - firstSeen >= STRANGER_SECONDS {
+              // Still not offered for capture after this long: it will not be, and holding
+              // frames for it would hold them for good. It is let through.
+              self.unsettled[id] = nil
+              self.ignored.insert(id)
+              given.insert(id)
+            }
+            // Otherwise it stays unsettled: a window that has only just opened may not be
+            // on the list yet. Frames stay held and the next one asks again.
+          }
+          return given
+        }
+        if applied != nil { self.filterRefreshes += 1 }
+        if !beyond.isEmpty, !self.saidBeyond {
+          self.saidBeyond = true
+          emit([
+            "event": "notice", "code": "not-excludable",
+            "message":
+              "A window over this one could not be kept out of the capture: the system does not offer it for exclusion.",
+          ])
+        }
+        self.refreshing = false
+      }
+    }
   }
 
   // MARK: pointer (a performed take)
@@ -538,6 +856,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   func stop(reason: String) async {
     guard claimStop() else { return }
     timer?.cancel()
+    watcher?.cancel()
     // A capture that will not stop must not keep the take from being written.
     if let s = stream {
       do {
@@ -551,9 +870,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     }
     // Let the frame in hand finish. If the encoder is stuck inside it, the writer cannot be
     // finished and waiting would never end: say so and leave.
-    let drained = DispatchSemaphore(value: 0)
-    videoQ.async { drained.signal() }
-    if drained.wait(timeout: .now() + DRAIN_SECONDS) == .timedOut {
+    if !drains(videoQ, within: DRAIN_SECONDS) {
       emit([
         "event": "error", "code": "write-failed",
         "message":
@@ -599,6 +916,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "app": ["name": appName, "id": appID],
     ]
     if resized { meta["resizedDuringTake"] = true }
+    if cornerRadius > 0 { meta["cornerRadius"] = r1(cornerRadius) }
     let cursorFile = outDir.appendingPathComponent("cursor.json")
     let metaFile = outDir.appendingPathComponent("meta.json")
     func write(_ file: URL, _ obj: Any) -> Bool {
@@ -618,6 +936,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "event": "stopped", "reason": reason, "durationMs": durationMs.rounded(), "frames": frames,
       "idleFrames": idle, "droppedFrames": dropped, "bytes": bytes, "events": track.count,
       "windowMoved": moved, "resized": resized,
+      "sourceUpdates": watchQ.sync { sourceUpdates }, "filterRefreshes": watchQ.sync { filterRefreshes },
+      "heldFrames": held,
       "files": ["recording": recordingFile.path, "cursor": cursorFile.path, "meta": metaFile.path],
       "clock": [
         "t0Host": t0Host ?? 0,

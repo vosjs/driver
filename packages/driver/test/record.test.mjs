@@ -18,6 +18,7 @@ import {
   killStarted,
   onMac,
   openFixture,
+  probe,
   readJson,
   runHelper,
   scratch,
@@ -39,6 +40,17 @@ const WAIT = 40_000
 const TEST = { timeout: 120_000 }
 
 const even = (n) => n - (n % 2)
+
+/** The fixture window's flat colour, as it comes back out of a recording: blue leads. */
+const isFixtureBlue = ([r, g, b]) => b > 120 && b - r > 60 && b - g > 30
+// Black to the eye. An encoder bleeds a little of a neighbouring colour into it, the
+// software one more than the hardware one, so this is not zero.
+const isBlack = ([r, g, b]) => r < 32 && g < 32 && b < 32
+/** Two patches of the window's content, clear of the moving bar: bottom left and bottom right. */
+const CONTENT = [
+  [40, -60, 40, 40],
+  [-80, -60, 40, 40],
+]
 
 /** The type of a file's first box: an MP4 begins with `ftyp`. */
 function boxType(file) {
@@ -188,6 +200,103 @@ describe('recording a window', { skip }, () => {
       assert.equal(probe.height, ready.captureHeight)
     },
   )
+
+  it('says how round the window is, and the take keeps it', TEST, async () => {
+    const t = start({ window: fixture.id, out: out(), pointer: false })
+    const ready = await t.ready()
+    // A titled window's corners are rounded: a handful of points, never a third of the window.
+    assert.ok(ready.cornerRadius > 3 && ready.cornerRadius < 40, `${ready.cornerRadius} points`)
+    await sleep(300)
+    const stopped = await t.stop()
+    assert.equal(readJson(stopped.files.meta).cornerRadius, ready.cornerRadius)
+  })
+
+  it(
+    'the picture is the window: its own colour inside, black outside its corners',
+    TEST,
+    async () => {
+      const t = start({ window: fixture.id, out: out(), pointer: false })
+      await t.ready()
+      await sleep(700)
+      const stopped = await t.stop()
+      const at = stopped.durationMs / 1000 / 2
+      const corners = probe(
+        stopped.files.recording,
+        at,
+        [0, 0, 3, 3],
+        [-3, 0, 3, 3],
+        [0, -3, 3, 3],
+        [-3, -3, 3, 3],
+      )
+      for (const corner of corners) assert.ok(isBlack(corner), `a corner is ${corner}`)
+      for (const patch of probe(stopped.files.recording, at, ...CONTENT)) {
+        assert.ok(isFixtureBlue(patch), `the content is ${patch}`)
+      }
+    },
+  )
+
+  it('follows the window when it moves: the picture stays the window', TEST, async () => {
+    const t = start({ window: fixture.id, out: out(), pointer: false })
+    await t.ready()
+    await sleep(400)
+    // Far enough that a capture left where the window was would show none of it there.
+    await fixture.move(180, 120)
+    try {
+      await sleep(1200)
+      const stopped = await t.stop()
+      assert.equal(stopped.windowMoved, true)
+      assert.ok(stopped.sourceUpdates >= 1, `${stopped.sourceUpdates} updates of the capture`)
+      const late = stopped.durationMs / 1000 - 0.15
+      for (const patch of probe(stopped.files.recording, late, ...CONTENT)) {
+        assert.ok(isFixtureBlue(patch), `after the move the content is ${patch}`)
+      }
+    } finally {
+      await fixture.move(-180, -120)
+      await sleep(300)
+    }
+  })
+
+  it("another app's window over it is never in the picture, not for a frame", TEST, async () => {
+    const notices = []
+    const t = start(
+      { window: fixture.id, out: out(), pointer: false },
+      { onEvent: (e) => e.event === 'notice' && notices.push(`${e.code}: ${e.message}`) },
+    )
+    await t.ready()
+    await sleep(400)
+    // Another application opens a red window exactly over this one, mid-take.
+    const other = await openFixture({ color: [200, 40, 40], title: 'another app' })
+    try {
+      await sleep(1500)
+      const stopped = await t.stop()
+      // What the helper did about it, for a failure to say more than a colour.
+      const did = `${stopped.filterRefreshes} refreshes, ${stopped.heldFrames} frames held, ${stopped.frames} written; notices: ${notices.join(' | ') || 'none'}`
+      assert.ok(
+        stopped.filterRefreshes >= 1,
+        `the capture learned of the other application (${did})`,
+      )
+      assert.ok(stopped.frames >= 5, `the take went on (${did})`)
+      // Every twentieth of a second, from before the other window opened to the end.
+      const end = stopped.durationMs / 1000 - 0.05
+      const seen = []
+      for (let at = 0.1; at < end; at += 0.05) {
+        const [patch] = probe(stopped.files.recording, at, CONTENT[0])
+        seen.push({ at: at.toFixed(2), patch })
+      }
+      const wrong = seen.filter((s) => !isFixtureBlue(s.patch))
+      // On failure, when the other window showed and for how long says what went wrong:
+      // the whole run of samples, by their red channel.
+      assert.equal(
+        wrong.length,
+        0,
+        `the other window is in ${wrong.length} of ${seen.length} samples, first at ${wrong[0]?.at} s as ${wrong[0]?.patch}; ` +
+          `red over time: ${seen.map((s) => s.patch[0]).join(' ')} (${did})`,
+      )
+    } finally {
+      other.close()
+      await sleep(300)
+    }
+  })
 
   it('samples the pointer when asked, as events in the window space', TEST, async () => {
     const t = start({ window: fixture.id, out: out(), pointer: true })

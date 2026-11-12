@@ -17,7 +17,6 @@ Early. What that means today:
 - **The helper is not signed with a Developer ID or notarised.** It carries an ad-hoc signature, which is enough to run. macOS therefore records its permissions against the app that launched it (your terminal, your editor, your agent's host), not against the helper.
 - The Intel half of the binary records real takes in CI, on a hosted Intel runner. It has not been run on a physical Intel Mac.
 - No audio, no webcam, no whole-display capture.
-- Other applications are left out of the picture by a list fixed when the take starts. An app launched during a take can appear over the window.
 
 ## Use it from JavaScript
 
@@ -117,6 +116,7 @@ take/
   "captureWidth": 1312,
   "captureHeight": 844,
   "dpr": 2,
+  "cornerRadius": 18.2,
   "zoom": 1,
   "fps": 60,
   "t0": 1794475400000,
@@ -142,7 +142,7 @@ macOS grants these to the app that launched the helper. If `check()` says `scree
 - **Put the system pointer in the picture.**
 - **Learn what was typed.** Typing is the system's count of key presses going up. No key code ever reaches the helper, and there is no keyboard listener in it to receive one.
 - **Read text.** With `frames: true` it reads where things are (an element's bounds, the insertion point's position), never what they say.
-- **Record anything but the one app.** Every other application is excluded from the capture, which is then cropped to the window.
+- **Record anything but the one app.** Every window that is not the app's is excluded from the capture, which is cropped to the window and follows it when it moves. A window that opens over it mid-take (a notification, an app you launch) is excluded as soon as it appears, and the frames it could be in are held back, so it is not in the file for even one.
 - **Name a window.** `meta.json` holds the app's name and bundle id, never a window title.
 - **Send anything anywhere.** The helper has no network code. It writes three files into the directory it was given.
 - **Sample on a timer, or keep running** after the process that started it is gone.
@@ -168,9 +168,9 @@ Every failure is a `DriverError` with a `code`.
 
 ## The filter
 
-The capture is the display with every other application excluded, cropped to the window (`others-out`). Scope is by exclusion and not by naming the window: on macOS 26, a filter that names the window or its app makes the system draw its sharing control over the window's traffic lights, and that control lands in the recording. The other values (`window`, `app`, `display-window`, `display`) exist to measure other macOS versions.
+The capture is the display with every window that is not the app's excluded, cropped to the window (`others-out`). Scope is by exclusion and not by naming the window: on macOS 26, a filter that names the window or its app makes the system draw its sharing control over the window's traffic lights, and that control lands in the recording. The other values (`window`, `app`, `display-window`, `display`) exist to measure other macOS versions.
 
-Outside the window's rounded corners the recording is opaque black. An editor that frames the window should round its frame at least as much.
+Outside the window's rounded corners the recording is opaque black. `ready` and `meta.json` say how round they are (`cornerRadius`, in points), so an editor that frames the window can round its frame at least as much.
 
 ## Develop
 

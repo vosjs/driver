@@ -119,36 +119,95 @@ export function runHelper(path, args, { stdin = 'ignore' } = {}) {
 }
 
 /**
- * Builds and shows the fixture window (Fixtures/window.swift): a titled window with a
- * moving bar, owned by a process of ours. Resolves with its window id.
+ * The test tools in Fixtures/, built once per run: `window` (a window to record) and
+ * `probe` (reads pixels out of a recording).
  */
-export async function openFixture() {
-  const { dir, remove } = scratch('vos-driver-fixture-')
-  const binary = join(dir, 'vos-driver-fixture')
-  execFileSync('swiftc', ['-O', join(root, 'Fixtures', 'window.swift'), '-o', binary], {
-    stdio: ['ignore', 'ignore', 'pipe'],
-  })
-  const child = track(spawn(binary, [], { stdio: ['pipe', 'pipe', 'inherit'] }))
-  const id = await within(
-    new Promise((resolve, reject) => {
-      let buffer = ''
-      child.stdout.setEncoding('utf8').on('data', (chunk) => {
-        buffer += chunk
-        const at = buffer.indexOf('\n')
-        if (at >= 0) resolve(JSON.parse(buffer.slice(0, at)).window)
-      })
-      child.on('error', reject)
-      child.on('close', () =>
-        reject(new Error('The fixture window closed before it reported its id.')),
+let tools
+function builtTools() {
+  if (!tools) {
+    const { dir, remove } = scratch('vos-driver-tools-')
+    process.on('exit', remove)
+    for (const name of ['window', 'probe']) {
+      execFileSync(
+        'swiftc',
+        ['-O', join(root, 'Fixtures', `${name}.swift`), '-o', join(dir, name)],
+        {
+          stdio: ['ignore', 'ignore', 'pipe'],
+        },
       )
-    }),
-    30_000,
-    'the fixture window reporting its id',
-  )
-  const close = () => {
-    child.stdin.end()
-    child.kill()
-    remove()
+    }
+    tools = { window: join(dir, 'window'), probe: join(dir, 'probe') }
   }
-  return { id, close }
+  return tools
+}
+
+/**
+ * Shows a fixture window (Fixtures/window.swift): titled, one flat colour, with a moving
+ * bar, owned by a process of ours. Resolves once it is on screen.
+ *
+ * `move(dx, dy)` moves it by that many points, right and down.
+ */
+export async function openFixture({ color, title } = {}) {
+  const args = []
+  if (color) args.push('--color', color.join(','))
+  if (title) args.push('--title', title)
+  const child = track(spawn(builtTools().window, args, { stdio: ['pipe', 'pipe', 'inherit'] }))
+  const said = []
+  const waiters = []
+  let ended = false
+  let buffer = ''
+  child.stdout.setEncoding('utf8').on('data', (chunk) => {
+    buffer += chunk
+    let at
+    while ((at = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, at).trim()
+      buffer = buffer.slice(at + 1)
+      if (line) said.push(JSON.parse(line))
+    }
+    for (const w of waiters.splice(0)) w()
+  })
+  child.on('close', () => {
+    ended = true
+    for (const w of waiters.splice(0)) w()
+  })
+  /** The next thing the window says that has this key. */
+  const next = (key) =>
+    within(
+      (async () => {
+        for (;;) {
+          const at = said.findIndex((line) => key in line)
+          if (at >= 0) return said.splice(at, 1)[0]
+          if (ended) throw new Error(`The fixture window closed before it said "${key}".`)
+          await new Promise((resolve) => waiters.push(resolve))
+        }
+      })(),
+      30_000,
+      `the fixture window saying "${key}"`,
+    )
+  const id = (await next('window')).window
+  return {
+    id,
+    async move(dx, dy) {
+      child.stdin.write(`move ${dx} ${dy}\n`)
+      await next('moved')
+    },
+    close() {
+      child.stdin.end()
+      child.kill()
+    },
+  }
+}
+
+/**
+ * The mean colour of rectangles of one frame of a recording (Fixtures/probe.swift).
+ * A rectangle is `[x, y, w, h]` in the recording's pixels; a negative x or y counts from
+ * the right or the bottom edge. Returns `[r, g, b]` per rectangle, 0 to 255.
+ */
+export function probe(recording, seconds, ...rects) {
+  const out = execFileSync(
+    builtTools().probe,
+    [recording, String(seconds), ...rects.map((r) => r.join(','))],
+    { encoding: 'utf8' },
+  )
+  return JSON.parse(out).colors
 }

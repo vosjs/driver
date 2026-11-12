@@ -21,8 +21,8 @@ export interface Rect {
 /**
  * How the window is scoped.
  *
- * `others-out` (the default) is the display with every other application excluded,
- * cropped to the window. The rest name the window or its app, and on macOS 26 that makes
+ * `others-out` (the default) is the display with every window that is not the app's
+ * excluded, cropped to the window. The rest name the window or its app, and on macOS 26 that makes
  * the system draw its sharing control over the window's traffic lights, where it lands
  * in the pixels. They are kept for measuring other macOS versions.
  */
@@ -97,6 +97,12 @@ export interface ReadyEvent {
   captureHeight: number
   filter: CaptureFilter
   accessibility: boolean
+  /**
+   * The radius of the window's own rounded corners, in points; 0 when they are square or
+   * could not be read. Outside them the recording is opaque black, so anything that frames
+   * the recording should be at least this round. It is also in `meta.json`.
+   */
+  cornerRadius: number
 }
 
 /** Why a take ended. */
@@ -130,13 +136,27 @@ export interface StoppedEvent {
   events: number
   windowMoved: boolean
   resized: boolean
+  /** Times the capture was moved to stay on the window. */
+  sourceUpdates: number
+  /** Times the list of excluded windows was brought up to date. */
+  filterRefreshes: number
+  /**
+   * Frames held back because a window of something else was over this one and not yet
+   * excluded. They are not in the file: the picture keeps its last clean frame.
+   */
+  heldFrames: number
   /** Absolute paths of what was written. */
   files: { recording: string; cursor: string; meta: string }
   /** Clock diagnostics: the host time of the first frame, and how late frames arrived. */
   clock: { t0Host: number; arrivalLagMsMean: number; arrivalLagMsMax: number }
 }
 
-/** Something worth knowing that did not end the take by itself. */
+/**
+ * Something worth knowing that did not end the take by itself. Codes so far:
+ * `stream-stopped` (the capture ended by itself), `slow-stop` (the capture took too long to
+ * stop; the take is written anyway), `not-excludable` (a window over this one could not be
+ * kept out of the capture).
+ */
 export interface NoticeEvent {
   event: 'notice'
   code: string
