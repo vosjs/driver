@@ -1,6 +1,6 @@
 {
   "name": "@vosjs/driver",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Records a desktop app's window for a vos take: a headless helper with no pointer in the pixels and the pointer's path beside the video, behind a small typed API.",
   "type": "module",
   "license": "MIT",
