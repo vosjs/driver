@@ -55,6 +55,11 @@ let DRAIN_SECONDS = 5.0
 /// it the helper says where it was and leaves: it never waits for good, whatever stalled.
 let BEGIN_SECONDS = 20.0
 
+/// How long frames are held for an owner the system's list of applications does not have yet.
+/// An application that has just opened its first window takes a moment to be listed; one that
+/// is still not listed after this is not going to be.
+let STRANGER_SECONDS = 2.0
+
 /// No window's corners are rounder than this. A corner that reads rounder is a window that
 /// is black where it meets the black outside it, and says nothing about its shape.
 let CORNER_CEILING_POINTS = 40.0
@@ -274,8 +279,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   /// Owners of windows the capture cannot exclude (the system does not list them as
   /// applications). They are let through: holding frames for them would hold every frame.
   var ignored: Set<pid_t> = []
-  /// Owners of windows seen over this one and not yet excluded or ignored.
-  var unsettled: Set<pid_t> = []
+  /// Owners of windows seen over this one and not yet excluded or ignored, with the host
+  /// time each was first seen.
+  var unsettled: [pid_t: Double] = [:]
   /// Frames taken before this host time may still show an application excluded since.
   var cleanFrom = 0.0
   /// Frames held back because another application's window was over this one.
@@ -534,13 +540,18 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
 
   // MARK: the window, for the length of the take
 
-  /// The radius of the window's rounded corners, read from a frame: how far along its top
-  /// and left edges the first pixel of the window is, at each of its four corners. Outside
-  /// the window the capture is black.
+  /// How round a frame around this window must be, read from a frame of it: the radius of
+  /// the smallest circular corner that covers ALL the black outside the window's own corners.
   ///
-  /// A window that is itself black at a corner reads as far rounder than any window is. Such
-  /// a corner says nothing and is left out: what is black against black needs no rounding.
-  /// 0 when no corner can be read, or the corners are square.
+  /// A window's corner is not a circle (macOS draws a continuous curve), and its edge is
+  /// anti-aliased against the black, so its extent along one edge says too little: a circle
+  /// that only reaches that far leaves a sliver of black showing. At each corner this takes
+  /// the black that is connected to the corner pixel, and for every pixel of it the radius a
+  /// circle tangent to both edges needs to leave that pixel outside.
+  ///
+  /// A corner whose black runs on past any window's roundness is a window that is itself
+  /// black there: it says nothing about its shape and is left out, and what is black against
+  /// black needs no rounding. 0 when no corner can be read, or the corners are square.
   func cornerRadiusPoints(_ sb: CMSampleBuffer) -> Double {
     guard followsWindow, let pb = CMSampleBufferGetImageBuffer(sb),
       CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA
@@ -553,27 +564,41 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     let stride = CVPixelBufferGetBytesPerRow(pb)
     let bytes = base.assumingMemoryBound(to: UInt8.self)
     let pixelsPerPoint = Double(w) / max(1, Double(pointSize.width))
-    let ceiling = Int(CORNER_CEILING_POINTS * pixelsPerPoint)
-    guard min(w, h) > 2 * ceiling, ceiling > 0 else { return 0 }
-    func ofWindow(_ x: Int, _ y: Int) -> Bool {
+    let box = Int(CORNER_CEILING_POINTS * pixelsPerPoint)
+    guard box > 1, min(w, h) > 2 * box else { return 0 }
+    /// Black to the eye: the outside, and the faint edge pixels that are mostly outside.
+    func outside(_ x: Int, _ y: Int) -> Bool {
       let i = y * stride + x * 4
-      return bytes[i] > 2 || bytes[i + 1] > 2 || bytes[i + 2] > 2
+      return bytes[i] <= 16 && bytes[i + 1] <= 16 && bytes[i + 2] <= 16
     }
-    /// Steps from a corner along one edge until a pixel is the window's.
-    func reach(_ x0: Int, _ y0: Int, _ dx: Int, _ dy: Int) -> Int {
-      var n = 0
-      while n <= ceiling && !ofWindow(x0 + dx * n, y0 + dy * n) { n += 1 }
-      return n
+    /// The radius one corner needs, in pixels; nil when it cannot be read. (cx, cy) is the
+    /// corner pixel and (sx, sy) points into the frame.
+    func need(_ cx: Int, _ cy: Int, _ sx: Int, _ sy: Int) -> Double? {
+      guard outside(cx, cy) else { return 0 }  // a square corner
+      var seen = [Bool](repeating: false, count: box * box)
+      var stack = [(0, 0)]
+      seen[0] = true
+      var most = 0.0
+      while let (x, y) = stack.popLast() {
+        // Black that reaches the edge of the box is not a corner's.
+        if x == box - 1 || y == box - 1 { return nil }
+        // The far corner of the pixel: the whole pixel must fall outside the circle.
+        let fx = Double(x + 1)
+        let fy = Double(y + 1)
+        most = max(most, fx + fy + (2 * fx * fy).squareRoot())
+        for (nx, ny) in [(x + 1, y), (x, y + 1), (x - 1, y), (x, y - 1)] where nx >= 0 && ny >= 0 {
+          let i = ny * box + nx
+          if !seen[i] && outside(cx + sx * nx, cy + sy * ny) {
+            seen[i] = true
+            stack.append((nx, ny))
+          }
+        }
+      }
+      return most <= Double(box) ? most : nil
     }
-    let corners = [
-      max(reach(0, 0, 1, 0), reach(0, 0, 0, 1)),
-      max(reach(w - 1, 0, -1, 0), reach(w - 1, 0, 0, 1)),
-      max(reach(0, h - 1, 1, 0), reach(0, h - 1, 0, -1)),
-      max(reach(w - 1, h - 1, -1, 0), reach(w - 1, h - 1, 0, -1)),
-    ]
-    let readable = corners.filter { $0 <= ceiling }
-    guard let most = readable.max() else { return 0 }
-    return Double(most) / pixelsPerPoint
+    let corners = [need(0, 0, 1, 1), need(w - 1, 0, -1, 1), need(0, h - 1, 1, -1), need(w - 1, h - 1, -1, -1)]
+    guard let most = corners.compactMap({ $0 }).max() else { return 0 }
+    return most / pixelsPerPoint
   }
 
   func startWatching() {
@@ -663,7 +688,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
 
   /// Asks for these owners to be kept out, and holds frames until they are.
   func exclude(_ strangers: Set<pid_t>) {
-    locked(exLock) { unsettled.formUnion(strangers) }
+    let now = CACurrentMediaTime()
+    locked(exLock) {
+      for pid in strangers where unsettled[pid] == nil { unsettled[pid] = now }
+    }
     watchQ.async { self.refreshExclusions() }
   }
 
@@ -696,30 +724,32 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
             // Frames taken before now were taken under the old list.
             self.cleanFrom = since
           }
-          // Whoever was asked about and is still not excluded cannot be: the system does not
-          // list them, or the list could not be had. Holding on for them would hold for good.
-          let left = asked.subtracting(self.excluded)
-          self.ignored.formUnion(left)
-          self.unsettled.subtract(asked)
-          return left
+          var given = Set<pid_t>()
+          for (pid, firstSeen) in asked {
+            if self.excluded.contains(pid) {
+              self.unsettled[pid] = nil
+            } else if since - firstSeen >= STRANGER_SECONDS {
+              // Still not on the system's list of applications after this long: it will not
+              // be, and holding frames for it would hold them for good. It is let through.
+              self.unsettled[pid] = nil
+              self.ignored.insert(pid)
+              given.insert(pid)
+            }
+            // Otherwise it stays unsettled: an application that has only just opened its
+            // window may not be on the list yet. Frames stay held and the next one asks again.
+          }
+          return given
         }
         if applied != nil { self.filterRefreshes += 1 }
-        if applied == nil {
-          emit([
-            "event": "notice", "code": "exclusion-failed",
-            "message": "Another application's window is over this one and could not be kept out of the capture.",
-          ])
-        } else if !beyond.isEmpty, !self.saidBeyond {
+        if !beyond.isEmpty, !self.saidBeyond {
           self.saidBeyond = true
           emit([
             "event": "notice", "code": "not-excludable",
             "message":
-              "A window over this one belongs to something the system does not list as an application, so it cannot be kept out of the capture.",
+              "A window over this one could not be kept out of the capture: the system does not list its owner as an application.",
           ])
         }
         self.refreshing = false
-        // Someone may have arrived while this ran.
-        self.refreshExclusions()
       }
     }
   }

@@ -255,7 +255,11 @@ describe('recording a window', { skip }, () => {
   })
 
   it("another app's window over it is never in the picture, not for a frame", TEST, async () => {
-    const t = start({ window: fixture.id, out: out(), pointer: false })
+    const notices = []
+    const t = start(
+      { window: fixture.id, out: out(), pointer: false },
+      { onEvent: (e) => e.event === 'notice' && notices.push(`${e.code}: ${e.message}`) },
+    )
     await t.ready()
     await sleep(400)
     // Another application opens a red window exactly over this one, mid-take.
@@ -263,13 +267,18 @@ describe('recording a window', { skip }, () => {
     try {
       await sleep(1500)
       const stopped = await t.stop()
-      assert.ok(stopped.filterRefreshes >= 1, 'the capture learned of the other application')
-      assert.ok(stopped.frames >= 5, `the take went on (${stopped.frames} frames)`)
+      // What the helper did about it, for a failure to say more than a colour.
+      const did = `${stopped.filterRefreshes} refreshes, ${stopped.heldFrames} frames held, ${stopped.frames} written; notices: ${notices.join(' | ') || 'none'}`
+      assert.ok(
+        stopped.filterRefreshes >= 1,
+        `the capture learned of the other application (${did})`,
+      )
+      assert.ok(stopped.frames >= 5, `the take went on (${did})`)
       // Every tenth of a second, from before the other window opened to the end.
       const end = stopped.durationMs / 1000 - 0.05
       for (let at = 0.1; at < end; at += 0.1) {
         const [patch] = probe(stopped.files.recording, at, CONTENT[0])
-        assert.ok(isFixtureBlue(patch), `at ${at.toFixed(1)} s the content is ${patch}`)
+        assert.ok(isFixtureBlue(patch), `at ${at.toFixed(1)} s the content is ${patch} (${did})`)
       }
     } finally {
       other.close()

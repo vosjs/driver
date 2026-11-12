@@ -154,8 +154,8 @@ export interface StoppedEvent {
 /**
  * Something worth knowing that did not end the take by itself. Codes so far:
  * `stream-stopped` (the capture ended by itself), `slow-stop` (the capture took too long to
- * stop; the take is written anyway), `exclusion-failed` and `not-excludable` (a window over
- * this one could not be kept out of the capture).
+ * stop; the take is written anyway), `not-excludable` (a window over this one could not be
+ * kept out of the capture).
  */
 export interface NoticeEvent {
   event: 'notice'

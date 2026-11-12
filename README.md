@@ -116,7 +116,7 @@ take/
   "captureWidth": 1312,
   "captureHeight": 844,
   "dpr": 2,
-  "cornerRadius": 13.5,
+  "cornerRadius": 18.2,
   "zoom": 1,
   "fps": 60,
   "t0": 1794475400000,
