@@ -1,0 +1,24 @@
+{
+  "name": "vos-driver-repo",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "pnpm@9.14.2",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build-native.mjs && pnpm -r build",
+    "build:native": "node scripts/build-native.mjs",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "format": "prettier --write .",
+    "check": "prettier --check .",
+    "pack:all": "node scripts/pack.mjs",
+    "pack:verify": "node scripts/pack.mjs && node scripts/verify-install.mjs"
+  },
+  "devDependencies": {
+    "prettier": "^3.5.3",
+    "typescript": "^5"
+  }
+}

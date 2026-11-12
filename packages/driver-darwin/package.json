@@ -1,0 +1,36 @@
+{
+  "name": "@vosjs/driver-darwin",
+  "version": "0.1.0",
+  "description": "The macOS helper for @vosjs/driver: one universal binary (arm64 and x64), macOS 14 and later. Install @vosjs/driver, which brings this.",
+  "license": "MIT",
+  "author": "vosso",
+  "homepage": "https://github.com/vosjs/driver#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vosjs/driver.git",
+    "directory": "packages/driver-darwin"
+  },
+  "bugs": {
+    "url": "https://github.com/vosjs/driver/issues"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "bin": {
+    "vos-driver-native": "./bin/vos-driver"
+  },
+  "files": [
+    "bin"
+  ],
+  "preferUnplugged": true,
+  "scripts": {
+    "prepack": "node ../../scripts/check-binary.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

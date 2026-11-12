@@ -1,23 +1,32 @@
-// vos-driver: a headless helper that records one application window for a vos take. One process per take, no window, no state.
+// vos-driver: a headless helper that records one application window for a vos take.
+// One process per take, no window of its own, no settings, no state.
 //
-//   vos-driver check                 permissions, as JSON (run from a fresh process)
-//   vos-driver windows               windows that can be captured, as JSON lines
-//   vos-driver record '<json>'       record one window; NDJSON on stdout; "stop\n" on stdin ends it
+//   vos-driver version               the helper's version and protocol, as JSON
+//   vos-driver check                 permissions, as JSON (run from a fresh process: the answer is cached)
+//   vos-driver windows               windows that can be recorded, one JSON object per line
+//   vos-driver record '<json>'       record one window; JSON lines on stdout: `ready` once the
+//                                    first frame is in the file, then `stopped` or `error`
 //
-// record request:
-//   { "window": 1234 | "app": "TextEdit",   target (window id wins)
-//     "out": "/path/take",                   a directory: recording.mp4, cursor.json, meta.json
-//     "filter": "others-out" | …,            default: the display with every OTHER app excluded, cropped
-//                                            to the window. Naming the window or its app ("window", "app",
-//                                            "display-window") makes macOS draw its sharing control over the
-//                                            traffic lights, and that lands in the pixels.
-//     "fps": 60, "maxSeconds": 1800, "bitrate": 8000000,
-//     "pointer": true,                       sample the real pointer (a performed take)
-//     "frames": false,                       read element frames at a press (needs Accessibility)
-//     "surface": "app" }                     what meta.captureSurface says
+// A record request:
+//   { "window": 1234,          a window id from `windows`, or
+//     "app": "TextEdit",       an application's name or bundle id (its largest titled window)
+//     "out": "/path/take",     a directory: recording.mp4, cursor.json and meta.json are written there
+//     "fps": 60,               the frame-rate ceiling
+//     "bitrate": 8000000,      the encoder's average bit rate
+//     "maxSeconds": 3600,      a safety ceiling; pass your own
+//     "pointer": true,         sample the real pointer (a performed take)
+//     "frames": false,         read the bounds of what was pressed (needs Accessibility)
+//     "filter": "others-out" } how the window is scoped; see FILTERS
 //
-// The system pointer is never in the pixels. Samples are emitted on change, never on a timer.
-// Key identity never enters this process: typing is the system's COUNT of key-downs.
+// A take ends on `stop` and a newline on stdin, on SIGINT or SIGTERM, at maxSeconds, when the
+// capture stream stops, or when stdin is a pipe and it closes (the process that started this is
+// gone). End of input on a terminal, /dev/null or a file ends nothing.
+//
+// What this never does:
+//   - put the system pointer in the pixels;
+//   - learn what was typed: typing is the system's COUNT of key-downs going up, and no key code
+//     ever reaches this process;
+//   - sample on a timer: a parked pointer writes nothing, because the planners read the silence.
 
 import AVFoundation
 import AppKit
@@ -27,25 +36,116 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
+/// The wire protocol's version. It moves when a request field or an event changes meaning.
 let PROTOCOL = 1
+
+/// How the window is scoped. `others-out` is the display with every OTHER application excluded,
+/// cropped to the window: scope by exclusion. The rest name the window or its app, and on
+/// macOS 26 that makes the system draw its sharing control over the window's traffic lights,
+/// where it lands in the pixels. They are kept for measuring other macOS versions.
+let FILTERS = ["others-out", "window", "app", "display-window", "display"]
+
+/// How long a window may take to produce its first frame before the take is given up.
+let FIRST_FRAME_SECONDS = 5.0
+
+/// How long the frame in hand may take to finish when a take ends.
+let DRAIN_SECONDS = 5.0
+
+/// How long a take may take to begin, from the request to the first frame in the file. Past
+/// it the helper says where it was and leaves: it never waits for good, whatever stalled.
+let BEGIN_SECONDS = 20.0
 
 // MARK: output
 
 let outLock = NSLock()
+func locked<T>(_ lock: NSLock, _ body: () -> T) -> T {
+  lock.lock()
+  defer { lock.unlock() }
+  return body()
+}
 func emit(_ obj: [String: Any]) {
   guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
     var line = String(data: data, encoding: .utf8)
   else { return }
   line += "\n"
-  outLock.lock()
-  FileHandle.standardOutput.write(line.data(using: .utf8)!)
-  outLock.unlock()
+  locked(outLock) { FileHandle.standardOutput.write(line.data(using: .utf8)!) }
 }
 func fail(_ code: String, _ message: String) -> Never {
   emit(["event": "error", "code": code, "message": message])
   exit(1)
 }
 func r1(_ v: Double) -> Double { (v * 10).rounded() / 10 }
+
+// MARK: progress
+
+/// Where a take is on its way to its first frame, so a take that never begins can say where
+/// it stopped. Written from the task that starts the take, read by the limit that ends it.
+final class Progress: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stageNow = "reading the request"
+  private var hasBegun = false
+  private var accountNow: (@Sendable () -> String)?
+
+  var stage: String { locked(lock) { stageNow } }
+  var begun: Bool { locked(lock) { hasBegun } }
+  /// What became of the frames so far, once there is a writer to ask.
+  var account: String { locked(lock) { accountNow }?() ?? "" }
+
+  func at(_ stage: String) { locked(lock) { stageNow = stage } }
+  func begin() { locked(lock) { hasBegun = true } }
+  func accounting(_ account: @escaping @Sendable () -> String) { locked(lock) { accountNow = account } }
+}
+let progress = Progress()
+
+// MARK: time limits
+
+/// A system call that did not answer in time.
+struct TimedOut: Error, LocalizedError {
+  let what: String
+  let seconds: Double
+  var errorDescription: String? { "\(what) did not answer within \(Int(seconds)) s." }
+}
+
+/// How long the system may take to list windows, and to start or stop a capture.
+let SYSTEM_SECONDS = 10.0
+
+/// A value crossing from the task that made it to the one waiting for it.
+struct Handed<T>: @unchecked Sendable { let value: T }
+
+/// The first of two outcomes wins; the other is dropped.
+final class Once: @unchecked Sendable {
+  private let lock = NSLock()
+  private var taken = false
+  func claim() -> Bool {
+    locked(lock) {
+      if taken { return false }
+      taken = true
+      return true
+    }
+  }
+}
+
+/// Runs a system call with a limit. ScreenCaptureKit's calls can stall and do not hear a
+/// cancellation, so this does not wait for the stalled one: it answers `TimedOut` and leaves
+/// it behind. The helper exits soon after, which ends it.
+func limited<T>(
+  _ what: String, seconds: Double = SYSTEM_SECONDS, _ call: @escaping @Sendable () async throws -> Handed<T>
+) async throws -> T {
+  try await withCheckedThrowingContinuation { (c: CheckedContinuation<Handed<T>, Error>) in
+    let once = Once()
+    Task {
+      do {
+        let value = try await call()
+        if once.claim() { c.resume(returning: value) }
+      } catch {
+        if once.claim() { c.resume(throwing: error) }
+      }
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+      if once.claim() { c.resume(throwing: TimedOut(what: what, seconds: seconds)) }
+    }
+  }.value
+}
 
 // MARK: geometry
 
@@ -110,14 +210,16 @@ func caretRect() -> CGRect? {
 
 // MARK: recorder
 
-final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
+/// One take. Its state is touched from three places and each has its own guard: frames on
+/// `videoQ`, pointer samples on `pointerQ` (the track behind `evLock`), and the end of the take
+/// behind `stopLock`. Hence unchecked.
+final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
   let windowID: CGWindowID
   let outDir: URL
   let fps: Int
   let bitrate: Int
   let wantPointer: Bool
   let wantFrames: Bool
-  let surface: String
   let appName: String
   let appID: String
 
@@ -128,6 +230,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
   let pointerQ = DispatchQueue(label: "vos.driver.pointer")
   var timer: DispatchSourceTimer?
 
+  var readyEvent: [String: Any] = [:]
+
   // clock: zero is the first frame the file holds, on the host clock (seconds)
   var t0Host: Double?
   var t0Wall: Double = 0
@@ -135,6 +239,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
   var frames = 0
   var idle = 0
   var dropped = 0
+  /// Frames with new pixels handed over by the capture, whatever became of them.
+  var arrived = 0
   var arrivalLagSum = 0.0
   var arrivalLagMax = 0.0
 
@@ -154,11 +260,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
   var lastKeyCount: UInt32 = 0
   var lastKeyPing = -1.0
 
+  let stopLock = NSLock()
   var finished = false
+  /// What the process exits with once the take is over.
+  var exitCode: Int32 = 0
   let done = DispatchSemaphore(value: 0)
 
   init(
-    windowID: CGWindowID, outDir: URL, fps: Int, bitrate: Int, pointer: Bool, frames: Bool, surface: String,
+    windowID: CGWindowID, outDir: URL, fps: Int, bitrate: Int, pointer: Bool, frames: Bool,
     appName: String, appID: String
   ) {
     self.windowID = windowID
@@ -167,12 +276,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     self.bitrate = bitrate
     self.wantPointer = pointer
     self.wantFrames = frames
-    self.surface = surface
     self.appName = appName
     self.appID = appID
   }
 
+  var recordingFile: URL { outDir.appendingPathComponent("recording.mp4") }
+
   func start(content: SCShareableContent, window: SCWindow, filterKind: String) async throws {
+    progress.at("scoping the capture to the window")
     let filter: SCContentFilter
     let config = SCStreamConfiguration()
     let frame = window.frame
@@ -183,11 +294,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
       switch filterKind {
       case "display-window": filter = SCContentFilter(display: display, including: [window])
       case "display": filter = SCContentFilter(display: display, excludingWindows: [])
-      case "others-out":
-        // the display with every OTHER application excluded: scope by exclusion, not by naming the window
+      case "app": filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+      default:
+        // others-out: the display with every OTHER application excluded
         let others = content.applications.filter { $0.processID != app.processID }
         filter = SCContentFilter(display: display, excludingApplications: others, exceptingWindows: [])
-      default: filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
       }
       config.sourceRect = CGRect(
         x: frame.minX - display.frame.minX, y: frame.minY - display.frame.minY, width: frame.width,
@@ -216,10 +327,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     config.capturesAudio = false
     config.scalesToFit = true
 
-    try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-    let file = outDir.appendingPathComponent("recording.mp4")
-    try? FileManager.default.removeItem(at: file)
-    writer = try AVAssetWriter(outputURL: file, fileType: .mp4)
+    progress.at("opening the recording file")
+    try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+    try? FileManager.default.removeItem(at: recordingFile)
+    writer = try AVAssetWriter(outputURL: recordingFile, fileType: .mp4)
+    // Fragments while recording, so a killed process leaves more than an empty box.
     writer.movieFragmentInterval = CMTime(value: 1, timescale: 1)
     input = AVAssetWriterInput(
       mediaType: .video,
@@ -238,21 +350,38 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     input.expectsMediaDataInRealTime = true
     writer.add(input)
     guard writer.startWriting() else {
-      throw writer.error ?? NSError(domain: "vos.capture", code: 1)
+      throw writer.error ?? NSError(domain: "vos.driver", code: 1)
     }
+    progress.accounting { [weak self] in self?.frameAccount ?? "" }
 
-    let s = SCStream(filter: filter, configuration: config, delegate: self)
-    try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQ)
-    try await s.startCapture()
-    stream = s
+    progress.at("starting the capture")
 
-    emit([
+    // Everything the frame handler and `stop` read is in place BEFORE the capture starts:
+    // frames can arrive before `startCapture` returns, and on a slow machine they do.
+    //
+    // `ready` is said when the first frame is in the file (see the frame handler): only then
+    // does the take have a time zero for anything that follows to be measured against.
+    readyEvent = [
       "event": "ready", "protocol": PROTOCOL, "window": Int(windowID), "app": appName,
       "frame": ["x": frame.minX, "y": frame.minY, "w": frame.width, "h": frame.height],
       "scale": scale, "captureWidth": w, "captureHeight": h, "filter": filterKind,
       "accessibility": AXIsProcessTrusted(),
-    ])
-    if wantPointer { startPointer() }
+    ]
+    let s = SCStream(filter: filter, configuration: config, delegate: self)
+    try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQ)
+    stream = s
+    try await limited("The start of the capture") {
+      try await s.startCapture()
+      return Handed(value: ())
+    }
+    progress.at("waiting for the window's first frame to reach the file")
+
+    // A take with no frame in its file would leave the caller waiting on `ready` for good:
+    // a window that never draws, or frames the writer will not take.
+    DispatchQueue.global().asyncAfter(deadline: .now() + FIRST_FRAME_SECONDS) { [weak self] in
+      guard let self, self.frames == 0 else { return }
+      Task { await self.stop(reason: "no frame in the file after \(Int(FIRST_FRAME_SECONDS)) s") }
+    }
   }
 
   // MARK: frames
@@ -267,18 +396,26 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
       idle += 1
       return
     }
+    arrived += 1
     let pts = CMSampleBufferGetPresentationTimeStamp(sb).seconds
     let now = CACurrentMediaTime()
+    let lag = now - pts
+    arrivalLagSum += lag
+    arrivalLagMax = max(arrivalLagMax, lag)
+    // A frame the writer cannot take now is let go (an encoder still warming up does this).
+    // It defines nothing: time zero is the first frame that REACHES the file.
+    guard input.isReadyForMoreMediaData else {
+      dropped += 1
+      return
+    }
     if t0Host == nil {
       t0Host = pts
       t0Wall = Date().timeIntervalSince1970 * 1000 - (now - pts) * 1000
       writer.startSession(atSourceTime: .zero)
     }
-    let lag = now - pts
-    arrivalLagSum += lag
-    arrivalLagMax = max(arrivalLagMax, lag)
     let rel = pts - t0Host!
-    guard rel >= lastPTS, input.isReadyForMoreMediaData else {
+    // Times in the file only go forward.
+    guard frames == 0 || rel > lastPTS else {
       dropped += 1
       return
     }
@@ -292,9 +429,24 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     if let c = copy, input.append(c) {
       frames += 1
       lastPTS = rel
+      if frames == 1 {
+        progress.begin()
+        emit(readyEvent)
+        if wantPointer { startPointer() }
+      }
     } else {
       dropped += 1
+      // A writer that has failed takes no more frames: end the take now and say why.
+      if writer.status == .failed { Task { await self.stop(reason: "the writer failed") } }
     }
+  }
+
+  /// What became of the frames, for an error that has to explain a take with none.
+  var frameAccount: String {
+    var text =
+      "\(arrived) arrived, \(frames) written, \(dropped) refused, \(idle) unchanged; writer state \(writer.status.rawValue)"
+    if let error = writer.error { text += "; the writer said: \(error)" }
+    return text
   }
 
   func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -319,9 +471,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     if let r = rect {
       e["rect"] = ["x": r1(r.minX - origin.x), "y": r1(r.minY - origin.y), "w": r1(r.width), "h": r1(r.height)]
     }
-    evLock.lock()
-    events.append(e)
-    evLock.unlock()
+    locked(evLock) { events.append(e) }
   }
 
   func sample() {
@@ -331,6 +481,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     if abs(win.width - firstFrame.width) > 1 || abs(win.height - firstFrame.height) > 1 { resized = true }
     if abs(win.minX - firstFrame.minX) > 1 || abs(win.minY - firstFrame.minY) > 1 { moved = true }
     let inside = win.contains(pos)
+    // The track is the WINDOW's: every sample is taken against where the window is now.
     let origin = win.origin
 
     let down = CGEventSource.buttonState(.combinedSessionState, button: .left)
@@ -375,45 +526,104 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
   // MARK: stop
 
+  /// True for the first caller only: a take ends once, whatever asked.
+  func claimStop() -> Bool {
+    locked(stopLock) {
+      if finished { return false }
+      finished = true
+      return true
+    }
+  }
+
   func stop(reason: String) async {
-    if finished { return }
-    finished = true
+    guard claimStop() else { return }
     timer?.cancel()
-    try? await stream?.stopCapture()
-    videoQ.sync {}
+    // A capture that will not stop must not keep the take from being written.
+    if let s = stream {
+      do {
+        try await limited("The end of the capture") {
+          try await s.stopCapture()
+          return Handed(value: ())
+        }
+      } catch let late as TimedOut {
+        emit(["event": "notice", "code": "slow-stop", "message": late.localizedDescription])
+      } catch {}
+    }
+    // Let the frame in hand finish. If the encoder is stuck inside it, the writer cannot be
+    // finished and waiting would never end: say so and leave.
+    let drained = DispatchSemaphore(value: 0)
+    videoQ.async { drained.signal() }
+    if drained.wait(timeout: .now() + DRAIN_SECONDS) == .timedOut {
+      emit([
+        "event": "error", "code": "write-failed",
+        "message":
+          "The video encoder stopped answering while the take ended (\(reason)): \(frameAccount). The recording is not complete.",
+      ])
+      exit(1)
+    }
+
+    // No frame in the file: there is no take. Either the window drew nothing, or the writer
+    // refused what it was given, and the error says which.
+    guard frames > 0 else {
+      let account = frameAccount
+      let failed = writer.status == .failed
+      if writer.status == .writing { writer.cancelWriting() }
+      try? FileManager.default.removeItem(at: recordingFile)
+      emit([
+        "event": "error", "code": failed ? "write-failed" : "no-frames",
+        "message": "No frame reached the recording before the take ended (\(reason)): \(account).",
+      ])
+      exitCode = 1
+      done.signal()
+      return
+    }
+
     input.markAsFinished()
     await writer.finishWriting()
+    guard writer.status == .completed else {
+      let why = writer.error?.localizedDescription ?? "the writer ended in state \(writer.status.rawValue)"
+      emit(["event": "error", "code": "write-failed", "message": "The recording could not be written: \(why)"])
+      exitCode = 1
+      done.signal()
+      return
+    }
 
     let durationMs = lastPTS * 1000
-    evLock.lock()
-    let track = events.filter { ($0["t"] as? Double ?? 0) <= durationMs + 50 }
-    evLock.unlock()
+    let track = locked(evLock) { events.filter { ($0["t"] as? Double ?? 0) <= durationMs + 50 } }
 
     var meta: [String: Any] = [
       "dpr": scale, "zoom": 1, "t0": t0Wall.rounded(), "durationMs": durationMs.rounded(),
       "width": Int(pointSize.width.rounded()), "height": Int(pointSize.height.rounded()),
       "fps": fps, "captureWidth": pixelSize.w, "captureHeight": pixelSize.h,
-      "captureSurface": surface, "platform": "mac", "producer": "desktop",
+      "captureSurface": "app", "platform": "mac", "producer": "desktop",
       "app": ["name": appName, "id": appID],
     ]
     if resized { meta["resizedDuringTake"] = true }
-    func write(_ name: String, _ obj: Any) {
-      if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) {
-        try? d.write(to: outDir.appendingPathComponent(name))
-      }
+    let cursorFile = outDir.appendingPathComponent("cursor.json")
+    let metaFile = outDir.appendingPathComponent("meta.json")
+    func write(_ file: URL, _ obj: Any) -> Bool {
+      guard let d = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return false }
+      return (try? d.write(to: file)) != nil
     }
-    write("cursor.json", track)
-    write("meta.json", meta)
+    guard write(cursorFile, track), write(metaFile, meta) else {
+      emit(["event": "error", "code": "write-failed", "message": "The take's cursor.json or meta.json could not be written."])
+      exitCode = 1
+      done.signal()
+      return
+    }
 
-    let file = outDir.appendingPathComponent("recording.mp4")
-    let bytes = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? 0
+    let attrs = try? FileManager.default.attributesOfItem(atPath: recordingFile.path)
+    let bytes = (attrs?[.size] as? NSNumber)?.intValue ?? 0
     emit([
       "event": "stopped", "reason": reason, "durationMs": durationMs.rounded(), "frames": frames,
-      "idleFrames": idle, "droppedFrames": dropped, "bytes": bytes ?? 0, "events": track.count,
-      "windowMoved": moved, "resized": resized, "t0Host": t0Host ?? 0,
-      "arrivalLagMsMean": frames > 0 ? r1(arrivalLagSum / Double(frames + dropped) * 1000) : 0,
-      "arrivalLagMsMax": r1(arrivalLagMax * 1000),
-      "writerStatus": writer.status.rawValue, "writerError": writer.error?.localizedDescription ?? "",
+      "idleFrames": idle, "droppedFrames": dropped, "bytes": bytes, "events": track.count,
+      "windowMoved": moved, "resized": resized,
+      "files": ["recording": recordingFile.path, "cursor": cursorFile.path, "meta": metaFile.path],
+      "clock": [
+        "t0Host": t0Host ?? 0,
+        "arrivalLagMsMean": arrived > 0 ? r1(arrivalLagSum / Double(arrived) * 1000) : 0,
+        "arrivalLagMsMax": r1(arrivalLagMax * 1000),
+      ],
     ])
     done.signal()
   }
@@ -421,9 +631,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
 // MARK: verbs
 
+func cmdVersion() {
+  emit(["event": "version", "version": DRIVER_VERSION, "protocol": PROTOCOL])
+}
+
 func cmdCheck() {
   emit([
-    "event": "check", "protocol": PROTOCOL,
+    "event": "check", "version": DRIVER_VERSION, "protocol": PROTOCOL,
     "screenRecording": CGPreflightScreenCaptureAccess(),
     "accessibility": AXIsProcessTrusted(),
     "path": CommandLine.arguments[0],
@@ -434,30 +648,79 @@ func cmdCheck() {
 
 func shareable() async -> SCShareableContent {
   do {
-    return try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+    return try await limited("The list of the screen's windows") {
+      Handed(value: try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true))
+    }
+  } catch let late as TimedOut {
+    fail("start-failed", late.localizedDescription)
   } catch {
-    fail("screen-recording", "Screen Recording is not granted to the process that launched this: \(error.localizedDescription)")
+    fail(
+      "screen-recording",
+      "Screen Recording is not granted to the app that launched this (\(error.localizedDescription)). Switch it on in System Settings, Privacy & Security, Screen & System Audio Recording.")
   }
 }
 
+/// Windows a take can be of: ordinary layer, big enough to be a window and not a control.
+func recordable(_ content: SCShareableContent) -> [SCWindow] {
+  content.windows.filter { $0.windowLayer == 0 && $0.frame.width >= 120 && $0.frame.height >= 80 }
+}
+func titled(_ w: SCWindow) -> Bool { !(w.title ?? "").isEmpty }
+
 func cmdWindows() async {
   let content = await shareable()
-  for w in content.windows where w.windowLayer == 0 && w.frame.width >= 120 && w.frame.height >= 80 {
+  for w in recordable(content) {
     emit([
       "event": "window", "id": Int(w.windowID), "app": w.owningApplication?.applicationName ?? "",
-      "appId": w.owningApplication?.bundleIdentifier ?? "", "titled": !(w.title ?? "").isEmpty,
+      "appId": w.owningApplication?.bundleIdentifier ?? "", "titled": titled(w),
       "frame": ["x": w.frame.minX, "y": w.frame.minY, "w": w.frame.width, "h": w.frame.height],
     ])
   }
 }
 
+/// A stdin that closes because the process holding its other end is gone.
+func stdinIsPipe() -> Bool {
+  var st = stat()
+  guard fstat(0, &st) == 0 else { return false }
+  let type = st.st_mode & S_IFMT
+  return type == S_IFIFO || type == S_IFSOCK
+}
+
 func cmdRecord(_ json: String) async {
   guard let data = json.data(using: .utf8),
     let req = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-  else { fail("bad-request", "The record request is not JSON.") }
-  guard let out = req["out"] as? String else { fail("bad-request", "The request names no out directory.") }
+  else { fail("bad-request", "The record request is not a JSON object.") }
+  guard let out = req["out"] as? String, !out.isEmpty else {
+    fail("bad-request", "The request names no out directory.")
+  }
+  let filterKind = req["filter"] as? String ?? "others-out"
+  guard FILTERS.contains(filterKind) else {
+    fail("bad-request", "Unknown filter \"\(filterKind)\". One of: \(FILTERS.joined(separator: ", ")).")
+  }
+  let fps = req["fps"] as? Int ?? 60
+  guard (1...120).contains(fps) else { fail("bad-request", "fps is between 1 and 120.") }
+  let bitrate = req["bitrate"] as? Int ?? 8_000_000
+  guard bitrate >= 100_000 else { fail("bad-request", "bitrate is at least 100000.") }
+  let maxSeconds = (req["maxSeconds"] as? NSNumber)?.doubleValue ?? 3600
+  guard maxSeconds > 0 else { fail("bad-request", "maxSeconds is above 0.") }
+  guard req["window"] is Int || req["app"] is String else {
+    fail("bad-request", "The request names no target: a window id, or an app's name or bundle id.")
+  }
+
+  // Whatever stalls on the way to the first frame, the caller hears about it.
+  DispatchQueue.global().asyncAfter(deadline: .now() + BEGIN_SECONDS) {
+    guard !progress.begun else { return }
+    let account = progress.account
+    emit([
+      "event": "error", "code": "start-failed",
+      "message":
+        "The take did not begin within \(Int(BEGIN_SECONDS)) s. It was \(progress.stage)\(account.isEmpty ? "" : " (\(account))").",
+    ])
+    exit(1)
+  }
+
+  progress.at("listing the screen's windows")
   let content = await shareable()
-  let candidates = content.windows.filter { $0.windowLayer == 0 && $0.frame.width >= 120 && $0.frame.height >= 80 }
+  let candidates = recordable(content)
   var window: SCWindow?
   if let id = req["window"] as? Int {
     window = candidates.first { Int($0.windowID) == id }
@@ -465,33 +728,45 @@ func cmdRecord(_ json: String) async {
     let match = candidates.filter {
       $0.owningApplication?.applicationName == app || $0.owningApplication?.bundleIdentifier == app
     }
-    window = match.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+    // An app's alert is an untitled window of its own: the app's window is a titled one first.
+    let named = match.filter(titled)
+    let pool = named.isEmpty ? match : named
+    window = pool.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
   }
   guard let w = window else { fail("no-window", "No window on screen matches the request.") }
 
   let rec = Recorder(
-    windowID: w.windowID, outDir: URL(fileURLWithPath: out), fps: req["fps"] as? Int ?? 60,
-    bitrate: req["bitrate"] as? Int ?? 8_000_000, pointer: req["pointer"] as? Bool ?? true,
-    frames: req["frames"] as? Bool ?? false, surface: req["surface"] as? String ?? "app",
+    windowID: w.windowID, outDir: URL(fileURLWithPath: out), fps: fps, bitrate: bitrate,
+    pointer: req["pointer"] as? Bool ?? true, frames: req["frames"] as? Bool ?? false,
     appName: w.owningApplication?.applicationName ?? "", appID: w.owningApplication?.bundleIdentifier ?? "")
   do {
-    try await rec.start(content: content, window: w, filterKind: req["filter"] as? String ?? "others-out")
+    try await rec.start(content: content, window: w, filterKind: filterKind)
   } catch {
     fail("start-failed", error.localizedDescription)
   }
 
-  let maxSeconds = req["maxSeconds"] as? Double ?? 1800
   DispatchQueue.global().asyncAfter(deadline: .now() + maxSeconds) { Task { await rec.stop(reason: "cap") } }
+
+  let parentHoldsStdin = stdinIsPipe()
   Thread.detachNewThread {
     while let line = readLine() {
-      if line.trimmingCharacters(in: .whitespaces) == "stop" { break }
+      if line.trimmingCharacters(in: .whitespaces) == "stop" {
+        Task { await rec.stop(reason: "stop") }
+        return
+      }
     }
-    Task { await rec.stop(reason: "stop") }
+    // End of input. On a pipe, whatever started this is gone, and a recorder never outlives it.
+    if parentHoldsStdin { Task { await rec.stop(reason: "parent-gone") } }
   }
-  signal(SIGINT, SIG_IGN)
-  let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-  sig.setEventHandler { Task { await rec.stop(reason: "interrupt") } }
-  sig.resume()
+
+  var signals: [DispatchSourceSignal] = []
+  for (number, reason) in [(SIGINT, "interrupt"), (SIGTERM, "terminated")] {
+    signal(number, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
+    source.setEventHandler { Task { await rec.stop(reason: reason) } }
+    source.resume()
+    signals.append(source)
+  }
 
   await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
     DispatchQueue.global().async {
@@ -499,19 +774,28 @@ func cmdRecord(_ json: String) async {
       c.resume()
     }
   }
+  signals.forEach { $0.cancel() }
+  exit(rec.exitCode)
 }
+
+let USAGE = "usage: vos-driver version | check | windows | record '<json>'\n"
 
 @main
 struct Main {
   static func main() async {
-    _ = NSApplication.shared  // a window-server connection, or shareable content can hang in a bare tool
     let args = CommandLine.arguments
-    switch args.count > 1 ? args[1] : "" {
+    let verb = args.count > 1 ? args[1] : ""
+    if verb == "version" || verb == "--version" {
+      cmdVersion()
+      exit(0)
+    }
+    _ = NSApplication.shared  // a window-server connection, or shareable content can hang in a bare tool
+    switch verb {
     case "check": cmdCheck()
     case "windows": await cmdWindows()
     case "record": await cmdRecord(args.count > 2 ? args[2] : "")
     default:
-      FileHandle.standardError.write("usage: vos-driver check | windows | record '<json>'\n".data(using: .utf8)!)
+      FileHandle.standardError.write(USAGE.data(using: .utf8)!)
       exit(2)
     }
     exit(0)

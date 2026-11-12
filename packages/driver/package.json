@@ -1,0 +1,65 @@
+{
+  "name": "@vosjs/driver",
+  "version": "0.1.0",
+  "description": "Records a desktop app's window for a vos take: a headless helper with no pointer in the pixels and the pointer's path beside the video, behind a small typed API.",
+  "type": "module",
+  "license": "MIT",
+  "author": "vosso",
+  "homepage": "https://github.com/vosjs/driver#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vosjs/driver.git",
+    "directory": "packages/driver"
+  },
+  "bugs": {
+    "url": "https://github.com/vosjs/driver/issues"
+  },
+  "keywords": [
+    "vos",
+    "screen-recording",
+    "screencapturekit",
+    "macos",
+    "desktop",
+    "window-capture",
+    "cursor",
+    "product-video",
+    "agent"
+  ],
+  "bin": {
+    "vos-driver": "./bin/vos-driver.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "prepack": "node ../../scripts/check-dist.mjs",
+    "postpack": "rm -f README.md"
+  },
+  "optionalDependencies": {
+    "@vosjs/driver-darwin": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "typescript": "^5"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

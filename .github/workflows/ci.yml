@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A check reads the tree and writes nothing: the token it runs with can do
+# no more than that, whatever a dependency or a test tries.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple silicon, on the newest and the oldest Node the packages allow.
+          - os: macos-15
+            node: 22
+          - os: macos-15
+            node: 18
+          # An Intel Mac: the one place the x86_64 half of the helper is run.
+          - os: macos-15-intel
+            node: 22
+    runs-on: ${{ matrix.os }}
+    # The whole gate takes two minutes. A run that is still going at fifteen is stuck,
+    # and a stuck run says so here, not at the six-hour default.
+    timeout-minutes: 15
+    steps:
+      # Every action is pinned to a commit, with its version beside it;
+      # Dependabot moves the pins (.github/dependabot.yml). A floating tag
+      # is whatever its owner's account pushes next.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Formatting first: it needs no build and is the cheapest gate.
+      - run: pnpm check
+      # The universal helper (swiftc), then the wrapper.
+      - run: pnpm build
+      - run: pnpm typecheck
+      # The recording tests need Screen Recording granted to the runner's shell;
+      # where it is not, they say so and are skipped, and the rest still run.
+      - run: pnpm test
+      # Both packages packed as they would be published, installed into fresh
+      # npm and pnpm projects, and the installed helper run.
+      - run: pnpm pack:verify

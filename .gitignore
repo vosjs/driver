@@ -1,2 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build output
 build/
+dist/
+*.tsbuildinfo
+*.tgz
+
+# The built helper. It is made by `pnpm build` and never committed.
+packages/driver-darwin/bin/
+
+# The package's README is the repository's, copied in while packing.
+packages/driver/README.md
+
+# Logs
+*.log
+
+# Editor / OS
+.idea/
+.vscode/
 .DS_Store
+*.swp
