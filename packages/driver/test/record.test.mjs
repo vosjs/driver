@@ -43,7 +43,9 @@ const even = (n) => n - (n % 2)
 
 /** The fixture window's flat colour, as it comes back out of a recording: blue leads. */
 const isFixtureBlue = ([r, g, b]) => b > 120 && b - r > 60 && b - g > 30
-const isBlack = ([r, g, b]) => r < 12 && g < 12 && b < 12
+// Black to the eye. An encoder bleeds a little of a neighbouring colour into it, the
+// software one more than the hardware one, so this is not zero.
+const isBlack = ([r, g, b]) => r < 32 && g < 32 && b < 32
 /** Two patches of the window's content, clear of the moving bar: bottom left and bottom right. */
 const CONTENT = [
   [40, -60, 40, 40],
