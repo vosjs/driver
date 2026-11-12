@@ -48,6 +48,13 @@ let FILTERS = ["others-out", "window", "app", "display-window", "display"]
 /// How long a window may take to produce its first frame before the take is given up.
 let FIRST_FRAME_SECONDS = 5.0
 
+/// How long the frame in hand may take to finish when a take ends.
+let DRAIN_SECONDS = 5.0
+
+/// How long a take may take to begin, from the request to the first frame in the file. Past
+/// it the helper says where it was and leaves: it never waits for good, whatever stalled.
+let BEGIN_SECONDS = 20.0
+
 // MARK: output
 
 let outLock = NSLock()
@@ -68,6 +75,27 @@ func fail(_ code: String, _ message: String) -> Never {
   exit(1)
 }
 func r1(_ v: Double) -> Double { (v * 10).rounded() / 10 }
+
+// MARK: progress
+
+/// Where a take is on its way to its first frame, so a take that never begins can say where
+/// it stopped. Written from the task that starts the take, read by the limit that ends it.
+final class Progress: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stageNow = "reading the request"
+  private var hasBegun = false
+  private var accountNow: (@Sendable () -> String)?
+
+  var stage: String { locked(lock) { stageNow } }
+  var begun: Bool { locked(lock) { hasBegun } }
+  /// What became of the frames so far, once there is a writer to ask.
+  var account: String { locked(lock) { accountNow }?() ?? "" }
+
+  func at(_ stage: String) { locked(lock) { stageNow = stage } }
+  func begin() { locked(lock) { hasBegun = true } }
+  func accounting(_ account: @escaping @Sendable () -> String) { locked(lock) { accountNow = account } }
+}
+let progress = Progress()
 
 // MARK: time limits
 
@@ -211,6 +239,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   var frames = 0
   var idle = 0
   var dropped = 0
+  /// Frames with new pixels handed over by the capture, whatever became of them.
+  var arrived = 0
   var arrivalLagSum = 0.0
   var arrivalLagMax = 0.0
 
@@ -253,6 +283,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   var recordingFile: URL { outDir.appendingPathComponent("recording.mp4") }
 
   func start(content: SCShareableContent, window: SCWindow, filterKind: String) async throws {
+    progress.at("scoping the capture to the window")
     let filter: SCContentFilter
     let config = SCStreamConfiguration()
     let frame = window.frame
@@ -296,6 +327,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     config.capturesAudio = false
     config.scalesToFit = true
 
+    progress.at("opening the recording file")
     try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
     try? FileManager.default.removeItem(at: recordingFile)
     writer = try AVAssetWriter(outputURL: recordingFile, fileType: .mp4)
@@ -320,6 +352,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     guard writer.startWriting() else {
       throw writer.error ?? NSError(domain: "vos.driver", code: 1)
     }
+    progress.accounting { [weak self] in self?.frameAccount ?? "" }
+
+    progress.at("starting the capture")
 
     let s = SCStream(filter: filter, configuration: config, delegate: self)
     try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQ)
@@ -327,6 +362,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       try await s.startCapture()
       return Handed(value: ())
     }
+    progress.at("waiting for the window's first frame to reach the file")
     stream = s
 
     // `ready` is said when the first frame is in the file (see the frame handler): only then
@@ -337,10 +373,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "scale": scale, "captureWidth": w, "captureHeight": h, "filter": filterKind,
       "accessibility": AXIsProcessTrusted(),
     ]
-    // A window that never draws would leave the caller waiting on `ready` for good.
+    // A take with no frame in its file would leave the caller waiting on `ready` for good:
+    // a window that never draws, or frames the writer will not take.
     DispatchQueue.global().asyncAfter(deadline: .now() + FIRST_FRAME_SECONDS) { [weak self] in
-      guard let self, self.t0Host == nil else { return }
-      Task { await self.stop(reason: "no first frame in \(Int(FIRST_FRAME_SECONDS)) s") }
+      guard let self, self.frames == 0 else { return }
+      Task { await self.stop(reason: "no frame in the file after \(Int(FIRST_FRAME_SECONDS)) s") }
     }
   }
 
@@ -356,6 +393,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       idle += 1
       return
     }
+    arrived += 1
     let pts = CMSampleBufferGetPresentationTimeStamp(sb).seconds
     let now = CACurrentMediaTime()
     if t0Host == nil {
@@ -382,12 +420,23 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       frames += 1
       lastPTS = rel
       if frames == 1 {
+        progress.begin()
         emit(readyEvent)
         if wantPointer { startPointer() }
       }
     } else {
       dropped += 1
+      // A writer that has failed takes no more frames: end the take now and say why.
+      if writer.status == .failed { Task { await self.stop(reason: "the writer failed") } }
     }
+  }
+
+  /// What became of the frames, for an error that has to explain a take with none.
+  var frameAccount: String {
+    var text =
+      "\(arrived) arrived, \(frames) written, \(dropped) refused, \(idle) unchanged; writer state \(writer.status.rawValue)"
+    if let error = writer.error { text += "; the writer said: \(error)" }
+    return text
   }
 
   func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -490,13 +539,30 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         emit(["event": "notice", "code": "slow-stop", "message": late.localizedDescription])
       } catch {}
     }
-    videoQ.sync {}
+    // Let the frame in hand finish. If the encoder is stuck inside it, the writer cannot be
+    // finished and waiting would never end: say so and leave.
+    let drained = DispatchSemaphore(value: 0)
+    videoQ.async { drained.signal() }
+    if drained.wait(timeout: .now() + DRAIN_SECONDS) == .timedOut {
+      emit([
+        "event": "error", "code": "write-failed",
+        "message":
+          "The video encoder stopped answering while the take ended (\(reason)): \(frameAccount). The recording is not complete.",
+      ])
+      exit(1)
+    }
 
-    // No frame ever arrived: there is no take, and the writer has no session to finish.
-    guard t0Host != nil else {
-      writer.cancelWriting()
+    // No frame in the file: there is no take. Either the window drew nothing, or the writer
+    // refused what it was given, and the error says which.
+    guard frames > 0 else {
+      let account = frameAccount
+      let failed = writer.status == .failed
+      if writer.status == .writing { writer.cancelWriting() }
       try? FileManager.default.removeItem(at: recordingFile)
-      emit(["event": "error", "code": "no-frames", "message": "The window produced no frame before the take ended (\(reason))."])
+      emit([
+        "event": "error", "code": failed ? "write-failed" : "no-frames",
+        "message": "No frame reached the recording before the take ended (\(reason)): \(account).",
+      ])
       exitCode = 1
       done.signal()
       return
@@ -630,6 +696,19 @@ func cmdRecord(_ json: String) async {
     fail("bad-request", "The request names no target: a window id, or an app's name or bundle id.")
   }
 
+  // Whatever stalls on the way to the first frame, the caller hears about it.
+  DispatchQueue.global().asyncAfter(deadline: .now() + BEGIN_SECONDS) {
+    guard !progress.begun else { return }
+    let account = progress.account
+    emit([
+      "event": "error", "code": "start-failed",
+      "message":
+        "The take did not begin within \(Int(BEGIN_SECONDS)) s. It was \(progress.stage)\(account.isEmpty ? "" : " (\(account))").",
+    ])
+    exit(1)
+  }
+
+  progress.at("listing the screen's windows")
   let content = await shareable()
   let candidates = recordable(content)
   var window: SCWindow?
