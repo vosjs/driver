@@ -17,7 +17,8 @@
 //
 // It prints {"window": <id>} once it is on screen. On stdin, `move <dx> <dy>` moves it by
 // that many points (right and down) and prints {"moved": true}; `state` prints what was done
-// to it: {"clicks": n, "typed": n, "remember": bool, "again": n}. It exits when stdin closes.
+// to it: {"clicks": n, "typed": n, "remember": bool, "again": n, "held": "Shift"}, where
+// `held` is the modifier keys the system believes are down. It exits when stdin closes.
 import AppKit
 
 var color: [CGFloat] = [40, 90, 160]
@@ -103,8 +104,18 @@ final class Controls: NSObject, NSTextFieldDelegate {
   func controlTextDidChange(_ obj: Notification) {
     typedLabel.stringValue = "typed \(field.stringValue.count)"
   }
+  /// The modifier keys the system believes are held, now.
+  var held: String {
+    let f = CGEventSource.flagsState(.hidSystemState)
+    var names: [String] = []
+    if f.contains(.maskControl) { names.append("Control") }
+    if f.contains(.maskAlternate) { names.append("Alt") }
+    if f.contains(.maskShift) { names.append("Shift") }
+    if f.contains(.maskCommand) { names.append("Meta") }
+    return names.joined(separator: "+")
+  }
   var state: String {
-    "{\"clicks\":\(clicks),\"typed\":\(field.stringValue.count),\"remember\":\(remember.state == .on),\"again\":\(again)}"
+    "{\"clicks\":\(clicks),\"typed\":\(field.stringValue.count),\"remember\":\(remember.state == .on),\"again\":\(again),\"held\":\"\(held)\"}"
   }
 }
 

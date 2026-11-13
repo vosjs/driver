@@ -245,6 +245,36 @@ describe('scripting a window', { skip }, () => {
     assert.ok(g > 140 && g - r > 60 && g - b > 60, `the swatch is green at the end (${[r, g, b]})`)
   })
 
+  it('lets go of every modifier a chord or a click held', TEST, async () => {
+    // A posted event that only claims a modifier leaves the system believing it is held:
+    // the next click, a person's or a script's, is then a Control-click.
+    const before = await fixture.state()
+    assert.equal(before.held, '', 'nothing is held before the take')
+    const t = await drive()
+    for (const keys of ['Shift+F12', 'Control+F12', 'Meta+Alt+F12']) {
+      assert.equal((await t.send({ do: 'press', keys })).ok, true)
+      assert.equal((await fixture.state()).held, '', `nothing is held after ${keys}`)
+    }
+    // A click made with a modifier lets it go too, and the next plain click is a plain click.
+    const shifted = await t.send({
+      do: 'click',
+      selector: "button[name='Again']:nth(0)",
+      modifiers: ['Shift'],
+    })
+    assert.equal(shifted.ok, true)
+    assert.equal((await fixture.state()).held, '', 'nothing is held after a shift-click')
+    await t.send({ do: 'press', keys: 'Control+F12' })
+    await t.send({ do: 'click', selector: "button[id='save']" })
+    const after = await stateWhen((s) => s.clicks === before.clicks + 1)
+    assert.equal(
+      after.clicks,
+      before.clicks + 1,
+      'a click after a Control chord is a click, not a context menu',
+    )
+    await t.stop()
+    assert.equal((await fixture.state()).held, '', 'nothing is held after the take')
+  })
+
   it('says what it could not do, and the take goes on', TEST, async () => {
     const t = await drive()
     const none = await t.send({ do: 'locate', selector: "button[name='Nope']" })

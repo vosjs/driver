@@ -157,9 +157,12 @@ final class Driver: @unchecked Sendable {
             usleep(60_000)
             // The press carries the element's own bounds, not whatever a hit test finds there.
             rec.pressRect = t.rect
+            let held = try modifierFlags(cmd["modifiers"])
+            holdModifiers(held)
             press(
               at: t.point, count: (cmd["count"] as? Int) ?? 1, right: (cmd["button"] as? String) == "right",
-              flags: try modifierFlags(cmd["modifiers"]))
+              flags: held)
+            releaseModifiers(held)
             answer["pressed"] = true
           } else {
             answer["pressed"] = false
@@ -226,11 +229,13 @@ final class Driver: @unchecked Sendable {
         usleep(60_000)
         let held = try modifierFlags(cmd["modifiers"])
         rec.pressRect = from.rect
+        holdModifiers(held)
         postMouse(.leftMouseDown, from.point, flags: held)
         usleep(120_000)
         glide(to: end.point, ms: (cmd["ms"] as? NSNumber)?.doubleValue, dragging: true, flags: held)
         usleep(80_000)
         postMouse(.leftMouseUp, end.point, flags: held)
+        releaseModifiers(held)
         if let r = from.rect { answer["rect"] = rectJSON(r, try frame()) }
       case "move":
         guard let t = try target(cmd) else { throw notFound(cmd) }
