@@ -130,6 +130,8 @@ final class Driver: @unchecked Sendable {
       result["message"] = "A command says what to do: \"do\"."
       return result
     }
+    // A command changes what is on screen: what the take covers is looked for again at once.
+    defer { rec.masks?.soon() }
     do {
       let started = now
       var answer: [String: Any] = [:]
