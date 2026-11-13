@@ -113,6 +113,17 @@ func press(at p: CGPoint, count: Int = 1, right: Bool = false, flags: CGEventFla
 func typeText(_ text: String, delayMs: Double, stillThere: () -> Bool = { true }) -> Bool {
   for character in text {
     guard stillThere() else { return false }
+    // A new line and a tab are keys, not characters: an app acts on Return, it does not insert it.
+    if let code: CGKeyCode = character == "\n" ? 36 : character == "\t" ? 48 : nil {
+      for down in [true, false] {
+        guard let e = CGEvent(keyboardEventSource: inputSource, virtualKey: code, keyDown: down) else { continue }
+        e.flags = []
+        e.post(tap: .cghidEventTap)
+        if down { usleep(18_000) }
+      }
+      usleep(UInt32(max(0, delayMs) * 1000))
+      continue
+    }
     let units = Array(String(character).utf16)
     for down in [true, false] {
       guard let e = CGEvent(keyboardEventSource: inputSource, virtualKey: 0, keyDown: down) else { continue }

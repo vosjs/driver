@@ -116,6 +116,7 @@ describe('recording a window', { skip }, () => {
   it('lists the fixture window, titled, with its frame', TEST, () => {
     assert.ok(listed, 'the fixture window is among windows()')
     assert.equal(listed.titled, true)
+    assert.ok(Number.isInteger(listed.pid) && listed.pid > 0, 'a window says which process owns it')
     assert.equal(listed.frame.w, 480)
     assert.ok(listed.frame.h >= 320, 'the frame holds the title bar above 320 points of content')
     assert.equal(typeof listed.app, 'string')

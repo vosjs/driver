@@ -36,32 +36,33 @@ const stopped = await take.stop()
 console.log(stopped.durationMs, stopped.files.recording)
 ```
 
-| Export                      | What it does                                                                                                                 |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `check()`                   | The helper's version, and whether Screen Recording and Accessibility are granted. Read by a fresh helper process every call. |
-| `windows()`                 | The windows on screen that can be recorded: `id`, `app`, `appId`, `titled`, `frame`.                                         |
-| `record(request, options?)` | Starts a take and returns at once: `ready`, `done`, `stop()`, `send(command)`, `pid`.                                        |
-| `tree(request)`             | The outline of an app's window: each element a script can name, with a selector for it. Needs Accessibility.                 |
-| `still(request)`            | One PNG of the window as a take would show it: no pointer, nothing of any other app.                                         |
-| `driverPath()`              | Where the helper is on this machine.                                                                                         |
-| `DriverError`               | Every failure: read `code`, show `message`.                                                                                  |
-| `PROTOCOL_VERSION`          | The wire protocol this package speaks.                                                                                       |
+| Export                      | What it does                                                                                                                                                                                 |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `check()`                   | The helper's version, and whether Screen Recording and Accessibility are granted. Read by a fresh helper process every call.                                                                 |
+| `windows()`                 | The windows on screen that can be recorded: `id`, `app`, `appId`, `pid`, `titled`, `frame`.                                                                                                  |
+| `record(request, options?)` | Starts a take and returns at once: `ready`, `done`, `stop()`, `send(command)`, `pid`.                                                                                                        |
+| `tree(request)`             | The outline of an app's window: each element a script can name, with a selector for it, plus what the app is made of (`kind`) and whether its tree was there (`built`). Needs Accessibility. |
+| `still(request)`            | One PNG of the window as a take would show it: no pointer, nothing of any other app.                                                                                                         |
+| `driverPath()`              | Where the helper is on this machine.                                                                                                                                                         |
+| `DriverError`               | Every failure: read `code`, show `message`.                                                                                                                                                  |
+| `PROTOCOL_VERSION`          | The wire protocol this package speaks.                                                                                                                                                       |
 
 ### `record(request)`
 
-| Field        | Default        |                                                                                          |
-| ------------ | -------------- | ---------------------------------------------------------------------------------------- |
-| `window`     |                | A window id from `windows()`. Wins over `app`.                                           |
-| `app`        |                | An application's name or bundle id. Its largest titled window is recorded.               |
-| `out`        | required       | A directory. The take's three files are written there.                                   |
-| `fps`        | `60`           | The frame-rate ceiling, 1 to 120. Frames are written only when pixels change.            |
-| `bitrate`    | `8000000`      | The encoder's average bit rate.                                                          |
-| `maxSeconds` | `3600`         | A safety ceiling. Pass your own.                                                         |
-| `pointer`    | `true`         | Sample the real pointer into `cursor.json`.                                              |
-| `frames`     | `false`        | Read the bounds of what was pressed and typed in. Needs Accessibility.                   |
-| `filter`     | `'others-out'` | How the window is scoped. Leave it alone; see [the filter](#the-filter).                 |
-| `drive`      | `false`        | A scripted take: bring the app to the front, then take commands. Needs Accessibility.    |
-| `size`       |                | `{ w, h }` in points: give the window this size before the capture. Needs Accessibility. |
+| Field        | Default        |                                                                                                                  |
+| ------------ | -------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `window`     |                | A window id from `windows()`. Wins over `pid` and `app`.                                                         |
+| `pid`        |                | A process id: its largest titled window. Two instances of one app share a name and differ here. Wins over `app`. |
+| `app`        |                | An application's name or bundle id. Its largest titled window is recorded.                                       |
+| `out`        | required       | A directory. The take's three files are written there.                                                           |
+| `fps`        | `60`           | The frame-rate ceiling, 1 to 120. Frames are written only when pixels change.                                    |
+| `bitrate`    | `8000000`      | The encoder's average bit rate.                                                                                  |
+| `maxSeconds` | `3600`         | A safety ceiling. Pass your own.                                                                                 |
+| `pointer`    | `true`         | Sample the real pointer into `cursor.json`.                                                                      |
+| `frames`     | `false`        | Read the bounds of what was pressed and typed in. Needs Accessibility.                                           |
+| `filter`     | `'others-out'` | How the window is scoped. Leave it alone; see [the filter](#the-filter).                                         |
+| `drive`      | `false`        | A scripted take: bring the app to the front, then take commands. Needs Accessibility.                            |
+| `size`       |                | `{ w, h }` in points: give the window this size before the capture. Needs Accessibility.                         |
 
 `options.onEvent` receives every line the helper prints. `options.signal` ends the take as `stop()` does.
 
@@ -88,6 +89,10 @@ const click = await take.send({ do: 'click', selector: "button[name='Save']" })
 await take.stop()
 ```
 
+**A window that is not on screen yet is waited for**, four seconds: an app launched a moment ago has a process before it has a window.
+
+**Electron and other Chromium apps build their tree only when asked, and not at once.** `tree` asks, waits up to ten seconds, and answers with `kind` (`native`, `electron`, `chromium`) and `built`. When `built` is false the outline is a few empty groups: ask again in a moment, or launch the app with `--force-renderer-accessibility`, which builds it from the start. Asking switches accessibility on inside that app until it quits.
+
 A **selector** is a short path of steps. Each step is a role, then what the element is called or its accessibility identifier:
 
 | Selector                         | Names                                                      |
@@ -101,17 +106,18 @@ A **selector** is a short path of steps. Each step is a role, then what the elem
 
 A role is the accessibility role in lower case without its `AX` (`button`, `checkbox`, `textfield`, `textarea`, `link`, `menuitem`, `row`, `cell`), with `text` for static text, `radio` for a radio button and `popup` for a pop-up button. `tree` proposes one selector per element, the identifier first because it is the one that survives a redesign, and says whether it names that element alone. It leaves out the window's own close, minimise and zoom buttons: pressing one ends the take.
 
-| Command                                                  | What it does                                                                                                 |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `{ do: 'locate', selector }`                             | Finds without acting: `count`, and the first match's `rect`, `name` and `enabled`.                           |
-| `{ do: 'click', selector, count?, button?, modifiers? }` | The pointer travels to the element and presses it. A disabled one is reached, not pressed: `pressed: false`. |
-| `{ do: 'hover', selector }`                              | The pointer travels there and stays.                                                                         |
-| `{ do: 'type', text, selector?, delayMs? }`              | Presses the target if one is given, then types a character at a time.                                        |
-| `{ do: 'press', keys }`                                  | A chord (`Meta+S`, `Enter`, `Shift+Tab`) or a list of them.                                                  |
-| `{ do: 'scroll', dy?, dx?, selector?, ms? }`             | Turns the wheel, in points, over the target or where the pointer is.                                         |
-| `{ do: 'drag', selector, to, ms?, modifiers? }`          | Presses on the target, travels to `to` and lets go.                                                          |
-| `{ do: 'move', x, y, ms? }`                              | Moves the pointer and does nothing else.                                                                     |
-| `{ do: 'now' }`                                          | Nothing: its `tEnd` is the take's clock.                                                                     |
+| Command                                                  | What it does                                                                                                                                                                                            |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{ do: 'locate', selector }`                             | Finds without acting: `count`, and the first match's `rect`, `name` and `enabled`.                                                                                                                      |
+| `{ do: 'click', selector, count?, button?, modifiers? }` | The pointer travels to the element and presses it. A disabled one is reached, not pressed: `pressed: false`.                                                                                            |
+| `{ do: 'hover', selector }`                              | The pointer travels there and stays.                                                                                                                                                                    |
+| `{ do: 'type', text, selector?, delayMs? }`              | Presses the target if one is given, then types a character at a time. A new line in `text` is the Return key and a tab is the Tab key.                                                                  |
+| `{ do: 'press', keys }`                                  | A chord (`Meta+S`, `Enter`, `Shift+Tab`) or a list of them.                                                                                                                                             |
+| `{ do: 'scroll', dy?, dx?, selector?, ms? }`             | Turns the wheel, in points, over the target or where the pointer is.                                                                                                                                    |
+| `{ do: 'drag', selector, to, ms?, modifiers? }`          | Presses on the target, travels to `to` and lets go.                                                                                                                                                     |
+| `{ do: 'move', x, y, ms? }`                              | Moves the pointer and does nothing else.                                                                                                                                                                |
+| `{ do: 'now' }`                                          | Nothing: its `tEnd` is the take's clock.                                                                                                                                                                |
+| `{ do: 'focused' }`                                      | Nothing: says what a key would go to (`focused`: its role and bounds, and its name when it is not something typed into) and whether the app has the keyboard (`frontmost`). Ask it before typing blind. |
 
 A target is a `selector`, or `x` and `y` in the window's own points. Commands run one at a time in the order sent, and each answer carries `tStart` and `tEnd` in milliseconds on the take's clock, which is where the act is in the footage. A command that did nothing resolves with `ok: false`, a `code` (`not-found`, `not-in-view`, `not-frontmost`, `bad-request`, `no-tree`) and a `message`; the take goes on and the script decides.
 

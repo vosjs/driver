@@ -28,10 +28,12 @@ export interface Rect {
  */
 export type CaptureFilter = 'others-out' | 'window' | 'app' | 'display-window' | 'display'
 
-/** What `record` is asked for. Give `window` or `app`. */
+/** What `record` is asked for. Give `window`, `pid` or `app`. */
 export interface RecordRequest {
-  /** A window id from `windows()`. Wins over `app`. */
+  /** A window id from `windows()`. Wins over `pid` and `app`. */
   window?: number
+  /** A process id: its largest titled window is recorded. Wins over `app`. */
+  pid?: number
   /** An application's name or bundle id: its largest titled window is recorded. */
   app?: string
   /** A directory. `recording.mp4`, `cursor.json` and `meta.json` are written there. */
@@ -60,10 +62,12 @@ export interface RecordRequest {
   size?: { w: number; h: number }
 }
 
-/** What `tree` and `still` are asked about. Give `window` or `app`. */
+/** What `tree` and `still` are asked about. Give `window`, `pid` or `app`. */
 export interface WindowRequest {
-  /** A window id from `windows()`. Wins over `app`. */
+  /** A window id from `windows()`. Wins over `pid` and `app`. */
   window?: number
+  /** A process id: its main window. Wins over `app`. */
+  pid?: number
   /** An application's name or bundle id: its main window. */
   app?: string
 }
@@ -91,6 +95,17 @@ export interface TreeElement {
  */
 export interface TreeResult {
   app: string
+  /**
+   * What the app is made of, as far as its tree goes: `electron`, `chromium` (a browser, or
+   * another shell around Chromium's pages) or `native`.
+   */
+  kind: 'native' | 'electron' | 'chromium'
+  /**
+   * False when a Chromium app had not built the tree of its pages within the wait: the
+   * outline is then a few empty groups. Such an app builds it at once when launched with
+   * `--force-renderer-accessibility`.
+   */
+  built: boolean
   /** The window's size in points. */
   window: { w: number; h: number }
   elements: TreeElement[]
@@ -150,6 +165,8 @@ export type Command =
   | ({ do: 'move'; ms?: number } & CommandTarget)
   /** Does nothing: its answer's `tEnd` is the take's clock, now. */
   | { do: 'now' }
+  /** Acts on nothing: says what the keyboard would go to (`focused`, `frontmost`). */
+  | { do: 'focused' }
 
 /** A key held through a click or a drag. */
 export type Modifier = 'Meta' | 'Control' | 'Alt' | 'Shift'
@@ -186,6 +203,13 @@ export type CommandResult =
       rect?: Rect
       /** `click` only: false when the element is disabled, so it was reached and not pressed. */
       pressed?: boolean
+      /**
+       * `focused` only: the element a key would go to. Its role, its bounds, and its name when
+       * it is not something typed into. Absent when the app says nothing has focus.
+       */
+      focused?: { role: string; name?: string; rect?: Rect }
+      /** `focused` only: whether the app is the one the keyboard goes to. */
+      frontmost?: boolean
     }
   | { ok: false; code: CommandFailureCode; message: string }
 
@@ -216,6 +240,8 @@ export interface DriverWindow {
   app: string
   /** The owning application's bundle id, or empty. */
   appId: string
+  /** The owning process. Two instances of one app share a name and differ here. */
+  pid: number
   /** False for an alert or a panel with no title. */
   titled: boolean
   /** The window's frame in global points, origin top-left. */

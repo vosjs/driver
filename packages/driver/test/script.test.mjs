@@ -245,6 +245,66 @@ describe('scripting a window', { skip }, () => {
     assert.ok(g > 140 && g - r > 60 && g - b > 60, `the swatch is green at the end (${[r, g, b]})`)
   })
 
+  it('finds the window by its process, and says what the app is made of', TEST, async () => {
+    const mine = (await within(windows(), WAIT, 'windows()')).find((w) => w.id === fixture.id)
+    assert.ok(mine.pid > 0, 'a window says whose it is')
+    // Two instances of one app share a name; a process id is the one that is this window's.
+    const outline = await within(tree({ pid: mine.pid }), WAIT, 'tree({ pid })')
+    assert.equal(outline.kind, 'native')
+    assert.equal(outline.built, true)
+    assert.ok(outline.elements.some((e) => e.selector === "button[id='save']"))
+    const shot = await within(
+      still({ pid: mine.pid, out: join(out(), 'by-pid.png') }),
+      WAIT,
+      'still({ pid })',
+    )
+    assert.equal(shot.window, fixture.id)
+    const t = await drive({ window: undefined, pid: mine.pid })
+    assert.equal(t.ready.window, fixture.id)
+    await t.stop()
+  })
+
+  it(
+    'waits for a window that is not on screen yet, and says no-window when none comes',
+    TEST,
+    async () => {
+      const started = Date.now()
+      await assert.rejects(
+        within(tree({ pid: 1 }), WAIT, 'tree of a process with no window'),
+        (error) => error.code === 'no-window',
+      )
+      assert.ok(Date.now() - started > 2500, 'it waited before saying so')
+    },
+  )
+
+  it('says what a key would go to, and types a new line as the Return key', TEST, async () => {
+    const t = await drive()
+    await t.send({ do: 'click', selector: "textfield[id='title']" })
+    await sleep(250)
+    const on = await t.send({ do: 'focused' })
+    assert.equal(on.ok, true)
+    assert.equal(on.frontmost, true)
+    // A focused field is edited by a field editor: either is something typed into.
+    assert.ok(
+      ['textfield', 'textarea'].includes(on.focused.role),
+      `focus is on a ${on.focused.role}`,
+    )
+    assert.ok(!JSON.stringify(on).includes('value'), 'it never says what the field holds')
+
+    // Return in a one-line field ends the edit and selects what is there, so the "c" that
+    // follows replaces "ab": the new line was the Return key, not a character.
+    await t.send({ do: 'type', text: 'ab\nc' })
+    assert.equal((await stateWhen((s) => s.typed === 1)).typed, 1)
+    await t.send({ do: 'click', selector: "textfield[id='title']" })
+    await t.send({ do: 'press', keys: ['Meta+A', 'Backspace'] })
+    assert.equal((await stateWhen((s) => s.typed === 0)).typed, 0)
+
+    // After a press on a button, the keyboard is not in a field.
+    await t.send({ do: 'click', selector: "checkbox[id='remember']" })
+    await t.send({ do: 'click', selector: "checkbox[id='remember']" })
+    await t.stop()
+  })
+
   it('lets go of every modifier a chord or a click held', TEST, async () => {
     // A posted event that only claims a modifier leaves the system believing it is held:
     // the next click, a person's or a script's, is then a Control-click.
