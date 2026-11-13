@@ -27,8 +27,41 @@ func postMouse(
   guard let e = CGEvent(mouseEventSource: inputSource, mouseType: type, mouseCursorPosition: p, mouseButton: button)
   else { return }
   e.setIntegerValueField(.mouseEventClickState, value: Int64(clicks))
-  if !flags.isEmpty { e.flags = flags }
+  // Always said, even when it is none: an event that does not say takes whatever the
+  // system last heard, and a click that inherits Control is a context menu.
+  e.flags = flags
   e.post(tap: .cghidEventTap)
+}
+
+/// The modifier keys, in the order a hand puts them down: where each is on the keyboard.
+let MODIFIER_KEYS: [(CGEventFlags, CGKeyCode)] = [
+  (.maskControl, 59), (.maskAlternate, 58), (.maskShift, 56), (.maskCommand, 55),
+]
+
+/// Puts modifier keys down, as key events of their own: the system keeps a table of which
+/// are held, and an event that only CLAIMS a modifier leaves that table saying it still is.
+func holdModifiers(_ flags: CGEventFlags) {
+  var held: CGEventFlags = []
+  for (flag, code) in MODIFIER_KEYS where flags.contains(flag) {
+    held.insert(flag)
+    guard let e = CGEvent(keyboardEventSource: inputSource, virtualKey: code, keyDown: true) else { continue }
+    e.flags = held
+    e.post(tap: .cghidEventTap)
+    usleep(12_000)
+  }
+}
+
+/// Lets them go, last down first, until none is held. Every hold is followed by this, so
+/// nothing a script pressed is still down when the script, or the take, ends.
+func releaseModifiers(_ flags: CGEventFlags) {
+  var held = flags
+  for (flag, code) in MODIFIER_KEYS.reversed() where flags.contains(flag) {
+    held.remove(flag)
+    guard let e = CGEvent(keyboardEventSource: inputSource, virtualKey: code, keyDown: false) else { continue }
+    e.flags = held
+    e.post(tap: .cghidEventTap)
+    usleep(12_000)
+  }
 }
 
 /// How long the pointer takes to travel a distance: a reach across the window is slower than a
@@ -84,6 +117,7 @@ func typeText(_ text: String, delayMs: Double, stillThere: () -> Bool = { true }
     for down in [true, false] {
       guard let e = CGEvent(keyboardEventSource: inputSource, virtualKey: 0, keyDown: down) else { continue }
       units.withUnsafeBufferPointer { e.keyboardSetUnicodeString(stringLength: $0.count, unicodeString: $0.baseAddress) }
+      e.flags = []  // a character is itself: never somebody's Command or Control
       e.post(tap: .cghidEventTap)
       if down { usleep(18_000) }
     }
@@ -142,6 +176,8 @@ func pressKeys(_ chord: String) throws {
   guard let code = key else {
     throw InputError(code: "bad-request", message: "\"\(chord)\" names no key, only modifiers.")
   }
+  holdModifiers(flags)
+  defer { releaseModifiers(flags) }
   for down in [true, false] {
     guard let e = CGEvent(keyboardEventSource: inputSource, virtualKey: code, keyDown: down) else { continue }
     e.flags = flags
@@ -167,6 +203,7 @@ func scroll(dy: Double, dx: Double, ms: Double) {
       let e = CGEvent(
         scrollWheelEvent2Source: inputSource, units: .pixel, wheelCount: 2, wheel1: -stepY, wheel2: -stepX, wheel3: 0)
     {
+      e.flags = []
       e.post(tap: .cghidEventTap)
     }
     usleep(16_000)
