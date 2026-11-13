@@ -12,6 +12,7 @@
 //   {"id": 7, "do": "drag",   "selector": "...", "to": {"x": 300, "y": 200}}
 //   {"id": 8, "do": "move",   "x": 100, "y": 100}
 //   {"id": 9, "do": "now"}                                              the take's clock, and nothing else
+//   {"id": 10, "do": "focused"}                                         what the keyboard would go to: its role and bounds
 //
 // and each is answered, in order, with one line:
 //
@@ -135,6 +136,22 @@ final class Driver: @unchecked Sendable {
       switch verb {
       case "now":
         break
+      case "focused":
+        // What a key would go to, so a script can know before it types. Its role and where it
+        // is; its name when it is not something typed into. Never its value.
+        var value: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appElement(pid), kAXFocusedUIElementAttribute as CFString, &value) == .success,
+          let v = value
+        {
+          let el = v as! AXUIElement
+          let role = roleName(axString(el, kAXRoleAttribute as String))
+          var focused: [String: Any] = ["role": role]
+          let name = nameOf(el, role: role)
+          if !name.isEmpty { focused["name"] = name }
+          if let r = axRect(el) { focused["rect"] = rectJSON(r, try frame()) }
+          answer["focused"] = focused
+        }
+        answer["frontmost"] = frontmostPid() == pid
       case "locate":
         if let t = try target(cmd) {
           answer["count"] = t.count
@@ -241,7 +258,7 @@ final class Driver: @unchecked Sendable {
         guard let t = try target(cmd) else { throw notFound(cmd) }
         glide(to: t.point, ms: (cmd["ms"] as? NSNumber)?.doubleValue)
       default:
-        throw InputError(code: "bad-request", message: "\"\(verb)\" is not a command. One of: locate, click, hover, type, press, scroll, drag, move, now.")
+        throw InputError(code: "bad-request", message: "\"\(verb)\" is not a command. One of: locate, click, hover, type, press, scroll, drag, move, now, focused.")
       }
       result["ok"] = true
       result["tStart"] = r1(started)
@@ -278,6 +295,8 @@ func appWindow(_ req: [String: Any]) -> (pid: pid_t, name: String, window: AXUIE
     else { return nil }
     pid = owner
     wanted = windowFrame(CGWindowID(id))
+  } else if let given = req["pid"] as? Int {
+    pid = pid_t(given)
   } else if let app = req["app"] as? String {
     pid = NSWorkspace.shared.runningApplications.first {
       $0.localizedName == app || $0.bundleIdentifier == app
@@ -310,19 +329,64 @@ func cmdTree(_ json: String) {
   guard AXIsProcessTrusted() else { fail("accessibility", ACCESSIBILITY_NEEDED) }
   // An app that does not answer accessibility holds every question for seconds.
   answerWithin(BEGIN_SECONDS, "Reading the window's outline")
-  guard let found = appWindow(req) else { fail("no-window", "No window matches the request.") }
-  // A tree that was only just asked for takes a moment to be built (Chromium, Electron).
+  // An app launched a moment ago has a process before it has a window.
+  var target = appWindow(req)
+  let windowDeadline = CACurrentMediaTime() + WINDOW_WAIT_SECONDS
+  while target == nil, CACurrentMediaTime() < windowDeadline {
+    usleep(300_000)
+    target = appWindow(req)
+  }
+  guard let found = target else { fail("no-window", "No window matches the request.") }
+  // A Chromium app builds the tree of its pages only when asked, and not at once: an Electron
+  // app asked while it runs can take seconds. It is waited for, within a limit, and the answer
+  // says whether it came, so the caller can say what to do when it did not.
+  let kind = appKind(found.pid)
   var root = readTree(found.window)
-  var tries = 0
-  while tries < 6, (root.map { descendants($0).count } ?? 0) < 3 {
-    usleep(250_000)
+  let deadline = CACurrentMediaTime() + (kind == "native" ? 1.5 : TREE_BUILD_SECONDS)
+  while CACurrentMediaTime() < deadline, !(root.map { isBuilt($0, kind: kind) } ?? false) {
+    usleep(300_000)
     root = readTree(found.window)
-    tries += 1
   }
   guard let tree = root else { fail("no-tree", "The window offers no accessibility tree.") }
   emit([
-    "event": "tree", "app": found.name,
+    "event": "tree", "app": found.name, "kind": kind, "built": isBuilt(tree, kind: kind),
     "window": ["w": r1(found.frame.width), "h": r1(found.frame.height)],
     "elements": outline(tree, window: found.frame),
   ])
+}
+
+/// How long a Chromium app is given to build the tree it was asked for.
+let TREE_BUILD_SECONDS = 10.0
+
+/// What an app is made of, as far as its tree is concerned: `electron`, `chromium` (a browser
+/// or another shell around Chromium's pages) or `native`. Read from what its bundle carries.
+func appKind(_ pid: pid_t) -> String {
+  guard let bundle = NSRunningApplication(processIdentifier: pid)?.bundleURL else { return "native" }
+  let frameworks = bundle.appendingPathComponent("Contents/Frameworks")
+  guard let names = try? FileManager.default.contentsOfDirectory(atPath: frameworks.path) else { return "native" }
+  if names.contains("Electron Framework.framework") { return "electron" }
+  // Chromium's processes come as helper apps, and a renderer among them is the mark of its
+  // pages: "… Helper (Renderer).app" in a browser, "… (Renderer).app" in some shells.
+  if names.contains(where: { $0.hasSuffix("Renderer).app") }) { return "chromium" }
+  for name in names where name.hasSuffix(".framework") {
+    let helpers = frameworks.appendingPathComponent(name).appendingPathComponent("Helpers")
+    let versioned = frameworks.appendingPathComponent(name).appendingPathComponent("Versions/Current/Helpers")
+    for dir in [helpers, versioned] {
+      if let inside = try? FileManager.default.contentsOfDirectory(atPath: dir.path),
+        inside.contains(where: { $0.hasSuffix("Renderer).app") })
+      {
+        return "chromium"
+      }
+    }
+  }
+  return "native"
+}
+
+/// Whether the tree a window offers is the one a script can use. A native window's is, as
+/// soon as it has anything in it. A Chromium window's is once a page area has content: before
+/// that it is a few empty groups and the window's own buttons.
+func isBuilt(_ root: Node, kind: String) -> Bool {
+  let all = descendants(root)
+  if kind == "native" { return all.count >= 3 }
+  return all.contains { $0.role == "webarea" && !$0.children.isEmpty }
 }

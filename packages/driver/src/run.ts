@@ -162,7 +162,14 @@ export async function windows(): Promise<DriverWindow[]> {
   const events = await collect(['windows'])
   return events
     .filter((e): e is WindowEvent => e.event === 'window')
-    .map((w) => ({ id: w.id, app: w.app, appId: w.appId, titled: w.titled, frame: w.frame }))
+    .map((w) => ({
+      id: w.id,
+      app: w.app,
+      appId: w.appId,
+      pid: w.pid,
+      titled: w.titled,
+      frame: w.frame,
+    }))
 }
 
 /**
@@ -175,7 +182,13 @@ export async function tree(request: WindowRequest): Promise<TreeResult> {
   const events = await collect(['tree', JSON.stringify(request)])
   const found = events.find((e): e is TreeEvent => e.event === 'tree')
   if (!found) throw new DriverError('crashed', 'The helper answered `tree` with nothing.')
-  return { app: found.app, window: found.window, elements: found.elements }
+  return {
+    app: found.app,
+    kind: found.kind,
+    built: found.built,
+    window: found.window,
+    elements: found.elements,
+  }
 }
 
 /**

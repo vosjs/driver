@@ -1010,7 +1010,8 @@ func cmdWindows() async {
   for w in recordable(content) {
     emit([
       "event": "window", "id": Int(w.windowID), "app": w.owningApplication?.applicationName ?? "",
-      "appId": w.owningApplication?.bundleIdentifier ?? "", "titled": titled(w),
+      "appId": w.owningApplication?.bundleIdentifier ?? "", "pid": Int(w.owningApplication?.processID ?? 0),
+      "titled": titled(w),
       "frame": ["x": w.frame.minX, "y": w.frame.minY, "w": w.frame.width, "h": w.frame.height],
     ])
   }
@@ -1041,8 +1042,8 @@ func cmdRecord(_ json: String) async {
   guard bitrate >= 100_000 else { fail("bad-request", "bitrate is at least 100000.") }
   let maxSeconds = (req["maxSeconds"] as? NSNumber)?.doubleValue ?? 3600
   guard maxSeconds > 0 else { fail("bad-request", "maxSeconds is above 0.") }
-  guard req["window"] is Int || req["app"] is String else {
-    fail("bad-request", "The request names no target: a window id, or an app's name or bundle id.")
+  guard req["window"] is Int || req["pid"] is Int || req["app"] is String else {
+    fail("bad-request", "The request names no target: a window id, a process id, or an app's name or bundle id.")
   }
 
   // Whatever stalls on the way to the first frame, the caller hears about it.
@@ -1063,8 +1064,8 @@ func cmdRecord(_ json: String) async {
   if drives, !AXIsProcessTrusted() { fail("accessibility", ACCESSIBILITY_NEEDED) }
 
   progress.at("listing the screen's windows")
-  var content = await shareable()
-  guard var w = requestedWindow(req, content) else {
+  var (content, found) = await awaitedWindow(req)
+  guard var w = found else {
     fail("no-window", "No window on screen matches the request.")
   }
   let pid = w.owningApplication?.processID ?? 0
@@ -1146,13 +1147,36 @@ func cmdRecord(_ json: String) async {
   exit(rec.exitCode)
 }
 
-/// The window a request names: by its id, or the app's largest titled one.
+/// How long a request waits for a window that is not on screen yet: an app that was launched
+/// a moment ago has a process before it has a window.
+let WINDOW_WAIT_SECONDS = 4.0
+
+/// The window a request names, waited for.
+func awaitedWindow(_ req: [String: Any]) async -> (SCShareableContent, SCWindow?) {
+  let deadline = CACurrentMediaTime() + WINDOW_WAIT_SECONDS
+  var content = await shareable()
+  while true {
+    if let w = requestedWindow(req, content) { return (content, w) }
+    if CACurrentMediaTime() >= deadline { return (content, nil) }
+    usleep(300_000)
+    content = await shareable()
+  }
+}
+
+/// The window a request names: by its id, or the largest titled one of a process (`pid`) or
+/// of an app by name. A process id tells two instances of one app apart; a name cannot.
 func requestedWindow(_ req: [String: Any], _ content: SCShareableContent) -> SCWindow? {
   let candidates = recordable(content)
   if let id = req["window"] as? Int { return candidates.first { Int($0.windowID) == id } }
-  guard let app = req["app"] as? String else { return nil }
-  let match = candidates.filter {
-    $0.owningApplication?.applicationName == app || $0.owningApplication?.bundleIdentifier == app
+  let match: [SCWindow]
+  if let pid = req["pid"] as? Int {
+    match = candidates.filter { Int($0.owningApplication?.processID ?? -1) == pid }
+  } else if let app = req["app"] as? String {
+    match = candidates.filter {
+      $0.owningApplication?.applicationName == app || $0.owningApplication?.bundleIdentifier == app
+    }
+  } else {
+    return nil
   }
   // An app's alert is an untitled window of its own: the app's window is a titled one first.
   let named = match.filter(titled)
@@ -1200,8 +1224,8 @@ func cmdStill(_ json: String) async {
     fail("bad-request", "The request names no out file.")
   }
   answerWithin(BEGIN_SECONDS, "The picture of the window")
-  let content = await shareable()
-  guard let w = requestedWindow(req, content), let app = w.owningApplication,
+  let (content, found) = await awaitedWindow(req)
+  guard let w = found, let app = w.owningApplication,
     let display = content.displays.first(where: { $0.frame.intersects(w.frame) }) ?? content.displays.first
   else { fail("no-window", "No window on screen matches the request.") }
   do {
