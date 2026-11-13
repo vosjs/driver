@@ -151,10 +151,11 @@ function builtTools() {
  *
  * `move(dx, dy)` moves it by that many points, right and down.
  */
-export async function openFixture({ color, title } = {}) {
+export async function openFixture({ color, title, resizable } = {}) {
   const args = []
   if (color) args.push('--color', color.join(','))
   if (title) args.push('--title', title)
+  if (resizable) args.push('--resizable', 'yes')
   const child = track(spawn(builtTools().window, args, { stdio: ['pipe', 'pipe', 'inherit'] }))
   const said = []
   const waiters = []
@@ -193,6 +194,11 @@ export async function openFixture({ color, title } = {}) {
     id,
     async move(dx, dy) {
       child.stdin.write(`move ${dx} ${dy}\n`)
+      await next('moved')
+    },
+    /** Into the far corner of the screen's usable part (`corner`), or back where it opened (`home`). */
+    async place(where) {
+      child.stdin.write(`${where}\n`)
       await next('moved')
     },
     /** What was done to its controls: `{ clicks, typed, remember, again }`. */

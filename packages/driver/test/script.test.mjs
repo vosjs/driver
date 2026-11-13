@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 import { existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
-import { check, record, still, tree, windows } from '../dist/index.js'
+import { check, record, selectorProblem, still, tree, windows } from '../dist/index.js'
 import {
   has,
   killPid,
@@ -366,6 +366,129 @@ describe('scripting a window', { skip }, () => {
     const stopped = await t.stop()
     assert.equal(stopped.reason, 'stop')
     await assert.rejects(t.send({ do: 'now' }), /ended/)
+  })
+
+  it('covers what a mask names in every frame, before the frame is written', TEST, async () => {
+    // The swatch is white on the window's blue. Under a mask it is never in the file.
+    const outline = await within(tree({ window: fixture.id }), WAIT, 'tree()')
+    const swatch = outline.elements.find((e) => e.id === 'swatch')
+    const save = outline.elements.find((e) => e.id === 'save')
+    const notices = []
+    const dir = out()
+    const take = record(
+      {
+        window: fixture.id,
+        out: dir,
+        drive: true,
+        maxSeconds: 60,
+        mask: [
+          { selector: "image[id='swatch']" },
+          { x: save.rect.x, y: save.rect.y, w: save.rect.w, h: save.rect.h },
+          { selector: "button[name='Nope']" },
+        ],
+      },
+      { onEvent: (e) => e.event === 'notice' && notices.push(e.code) },
+    )
+    takes.push(take)
+    const ready = await within(take.ready, WAIT, 'ready')
+    assert.deepEqual(ready.masks, [1, 1, 0], 'ready says what each mask covers as the take begins')
+    assert.ok(notices.includes('mask-unmatched'), 'a mask that matches nothing is said')
+
+    // Pressing Save turns the swatch green: covered, the picture does not show that either.
+    const click = await within(
+      take.send({ do: 'click', selector: "button[id='save']" }),
+      WAIT,
+      'click',
+    )
+    assert.equal(click.ok, true)
+    await sleep(700)
+    const stopped = await within(take.stop(), WAIT, 'stop()')
+    assert.equal(stopped.maskedFrames, stopped.frames, 'every frame in the file was covered')
+    assert.deepEqual(
+      stopped.masks.map((m) => m.matched),
+      [1, 1, 0],
+    )
+    assert.equal(stopped.masks[0].selector, "image[id='swatch']")
+    assert.deepEqual(readJson(dir, 'meta.json').masks, stopped.masks, 'the take records its masks')
+
+    const scale = ready.scale
+    const inner = (r) => [
+      Math.round((r.x + 8) * scale),
+      Math.round((r.y + 8) * scale),
+      Math.round((r.w - 16) * scale),
+      Math.round((r.h - 16) * scale),
+    ]
+    const file = join(dir, 'recording.mp4')
+    for (const at of [0, stopped.durationMs / 1000 - 0.1]) {
+      const [[r, g, b], [sr, sg, sb]] = probe(file, at, inner(swatch.rect), inner(save.rect))
+      // The window's blue (40, 90, 160): not the swatch's white, not its green.
+      assert.ok(
+        b > r + 60 && b > g + 30 && r < 110,
+        `the swatch is covered at ${at}s (${[r, g, b]})`,
+      )
+      assert.ok(sb > sr + 60 && sr < 110, `the rectangle is covered at ${at}s (${[sr, sg, sb]})`)
+    }
+  })
+
+  it('refuses a mask that is not one before anything is recorded', TEST, async () => {
+    for (const mask of [[{ selector: 'button[[' }], [{ x: 0, y: 0, w: 0, h: 10 }], 'swatch']) {
+      const take = record({ window: fixture.id, out: out(), mask })
+      takes.push(take)
+      await assert.rejects(take.ready, (e) => e.code === 'bad-request', JSON.stringify(mask))
+    }
+  })
+
+  it('says of a selector what the helper says of it, without the helper', TEST, async () => {
+    const t = await drive()
+    const cases = [
+      "button[name='Save']",
+      "textfield[id='title']",
+      "button[name*='sav']",
+      "group[name='A'] > button",
+      'button:nth(1)',
+      "*[name='It\\'s']",
+      "[id='save']",
+      "popup[name^='Folder']",
+      'button[[',
+      "button[title='x']",
+      "button[name='x'",
+      "button[name='x]",
+      'button:first',
+      'button:nth(x)',
+      'button >',
+      "button[name='a']button",
+      '   ',
+    ]
+    for (const selector of cases) {
+      const answer = await t.send({ do: 'locate', selector })
+      const said = selectorProblem(selector)
+      if (answer.ok) assert.equal(said, null, `${selector} is one for the helper`)
+      else assert.equal(said, answer.message, `${selector}: the same refusal, word for word`)
+    }
+    assert.match(
+      selectorProblem("popup[name^='Folder']"),
+      /= or \*= is expected \(at character 11\)/,
+    )
+    await t.stop()
+  })
+
+  it('moves a window that would not fit before it is sized', TEST, async () => {
+    // A window in the far corner of the screen, asked for more than is left there. The
+    // system clips a window to its screen: sized where it stood, it would come out smaller.
+    const wide = await openFixture({ title: 'vos-driver fixture, resizable', resizable: true })
+    try {
+      await wide.place('corner')
+      await sleep(300)
+      const take = record({ window: wide.id, out: out(), maxSeconds: 30, size: { w: 640, h: 420 } })
+      takes.push(take)
+      const ready = await within(take.ready, WAIT, 'ready')
+      await within(take.stop(), WAIT, 'stop()')
+      assert.equal(ready.frame.w, 640, 'the take is the width it was asked to be')
+      // A title bar's height can round a point either way.
+      assert.ok(Math.abs(ready.frame.h - 420) <= 2, `and the height (${ready.frame.h})`)
+    } finally {
+      wide.close()
+    }
   })
 
   it('answers a command on a take that was not asked to drive', TEST, async () => {

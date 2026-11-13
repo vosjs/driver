@@ -20,6 +20,8 @@ export type {
   DriverWindow,
   ErrorEvent,
   HelperErrorCode,
+  MaskReport,
+  MaskTarget,
   Modifier,
   NoticeEvent,
   ReadyEvent,
@@ -38,4 +40,5 @@ export type {
   WindowRequest,
 } from './protocol.js'
 export { check, record, still, tree, windows } from './run.js'
+export { selectorProblem } from './selector.js'
 export type { RecordOptions, Recording } from './run.js'

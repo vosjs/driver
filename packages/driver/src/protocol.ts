@@ -60,7 +60,24 @@ export interface RecordRequest {
    * may refuse a size (its minimum, its screen); `ready.frame` says what the take is.
    */
   size?: { w: number; h: number }
+  /**
+   * What the take keeps out of its pixels: elements of the window by selector (every match),
+   * or rectangles of it in points. Each frame is covered there BEFORE it is encoded, with one
+   * flat colour taken from the edge of what is covered, so what was under a mask is in no
+   * file. A selector needs Accessibility.
+   *
+   * An element's bounds are read about thirty times a second: something that appears or
+   * moves is covered from the next reading, so a frame or two can show it first. What must
+   * never show is on screen before the take begins, or is given as a rectangle.
+   */
+  mask?: MaskTarget[]
 }
+
+/** One thing a take covers: an element (every match of a selector) or a rectangle of the window, in points. */
+export type MaskTarget = { selector: string } | Rect
+
+/** What a take says of one of its masks: the most elements it covered at once. */
+export type MaskReport = ({ selector: string } | { rect: Rect }) & { matched: number }
 
 /** What `tree` and `still` are asked about. Give `window`, `pid` or `app`. */
 export interface WindowRequest {
@@ -270,6 +287,11 @@ export interface ReadyEvent {
    * the recording should be at least this round. It is also in `meta.json`.
    */
   cornerRadius: number
+  /**
+   * With `mask`: how many elements each mask covers as the take begins, in the order they
+   * were given. A 0 also arrives as a `mask-unmatched` notice.
+   */
+  masks?: number[]
 }
 
 /** Why a take ended. */
@@ -312,6 +334,10 @@ export interface StoppedEvent {
    * excluded. They are not in the file: the picture keeps its last clean frame.
    */
   heldFrames: number
+  /** The take's masks, in the order they were given. Empty without `mask`. Also in `meta.json`. */
+  masks: MaskReport[]
+  /** Frames that were covered before they were written: every frame of a take with masks. */
+  maskedFrames: number
   /** Absolute paths of what was written. */
   files: { recording: string; cursor: string; meta: string }
   /** Clock diagnostics: the host time of the first frame, and how late frames arrived. */
@@ -322,7 +348,8 @@ export interface StoppedEvent {
  * Something worth knowing that did not end the take by itself. Codes so far:
  * `stream-stopped` (the capture ended by itself), `slow-stop` (the capture took too long to
  * stop; the take is written anyway), `not-excludable` (a window over this one could not be
- * kept out of the capture).
+ * kept out of the capture), `mask-unmatched` (a mask's selector matches nothing as the take
+ * begins).
  */
 export interface NoticeEvent {
   event: 'notice'

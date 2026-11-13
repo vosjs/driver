@@ -253,6 +253,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
 
   var readyEvent: [String: Any] = [:]
 
+  /// What the take keeps out of its pixels (Mask.swift). With masks, every frame is copied,
+  /// covered and handed to the writer through `adaptor`; without, frames go as they came.
+  var masks: Masks?
+  var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+
   // The capture follows the window and keeps every other application out, for the whole
   // take. All of this is read and written on `watchQ` alone.
   let watchQ = DispatchQueue(label: "vos.driver.window")
@@ -440,6 +445,15 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         ] as [String: Any],
       ])
     input.expectsMediaDataInRealTime = true
+    if masks != nil {
+      adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        assetWriterInput: input,
+        sourcePixelBufferAttributes: [
+          kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+          kCVPixelBufferWidthKey as String: w,
+          kCVPixelBufferHeightKey as String: h,
+        ])
+    }
     writer.add(input)
     guard writer.startWriting() else {
       throw writer.error ?? NSError(domain: "vos.driver", code: 1)
@@ -459,6 +473,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "scale": scale, "captureWidth": w, "captureHeight": h, "filter": filterKind,
       "accessibility": AXIsProcessTrusted(),
     ]
+    if let masks { readyEvent["masks"] = masks.matched }
     let s = SCStream(filter: filter, configuration: config, delegate: self)
     try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQ)
     stream = s
@@ -525,14 +540,24 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       dropped += 1
       return
     }
-    var timing = CMSampleTimingInfo(
-      duration: .invalid, presentationTimeStamp: CMTime(seconds: rel, preferredTimescale: 600_000),
-      decodeTimeStamp: .invalid)
-    var copy: CMSampleBuffer?
-    CMSampleBufferCreateCopyWithNewTiming(
-      allocator: nil, sampleBuffer: sb, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-      sampleBufferOut: &copy)
-    if let c = copy, input.append(c) {
+    let at = CMTime(seconds: rel, preferredTimescale: 600_000)
+    var written = false
+    if let masks {
+      // A frame that cannot be covered is not written: the picture keeps its last frame.
+      if let adaptor, let pool = adaptor.pixelBufferPool, let pixels = CMSampleBufferGetImageBuffer(sb),
+        let covered = masks.covering(pixels, pool: pool, window: pointSize)
+      {
+        written = adaptor.append(covered, withPresentationTime: at)
+      }
+    } else {
+      var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: at, decodeTimeStamp: .invalid)
+      var copy: CMSampleBuffer?
+      CMSampleBufferCreateCopyWithNewTiming(
+        allocator: nil, sampleBuffer: sb, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+        sampleBufferOut: &copy)
+      if let c = copy { written = input.append(c) }
+    }
+    if written {
       frames += 1
       lastPTS = rel
       if frames == 1 {
@@ -876,6 +901,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     guard claimStop() else { return }
     timer?.cancel()
     watcher?.cancel()
+    masks?.end()
     // A capture that will not stop must not keep the take from being written.
     if let s = stream {
       do {
@@ -936,6 +962,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     ]
     if resized { meta["resizedDuringTake"] = true }
     if cornerRadius > 0 { meta["cornerRadius"] = r1(cornerRadius) }
+    if let masks { meta["masks"] = masks.report }
     let cursorFile = outDir.appendingPathComponent("cursor.json")
     let metaFile = outDir.appendingPathComponent("meta.json")
     func write(_ file: URL, _ obj: Any) -> Bool {
@@ -957,6 +984,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "windowMoved": moved, "resized": resized,
       "sourceUpdates": watchQ.sync { sourceUpdates }, "filterRefreshes": watchQ.sync { filterRefreshes },
       "heldFrames": held,
+      "masks": masks?.report ?? [], "maskedFrames": masks?.painted ?? 0,
       "files": ["recording": recordingFile.path, "cursor": cursorFile.path, "meta": metaFile.path],
       "clock": [
         "t0Host": t0Host ?? 0,
@@ -1046,6 +1074,13 @@ func cmdRecord(_ json: String) async {
     fail("bad-request", "The request names no target: a window id, a process id, or an app's name or bundle id.")
   }
 
+  let maskSpecs: [Masks.Spec]
+  do { maskSpecs = try Masks.parse(req["mask"]) } catch { fail("bad-request", error.localizedDescription) }
+  // An element is found through the app's accessibility tree: said before anything is recorded.
+  if maskSpecs.contains(where: { $0.selector != nil }), !AXIsProcessTrusted() {
+    fail("accessibility", ACCESSIBILITY_NEEDED)
+  }
+
   // Whatever stalls on the way to the first frame, the caller hears about it.
   DispatchQueue.global().asyncAfter(deadline: .now() + BEGIN_SECONDS) {
     guard !progress.begun else { return }
@@ -1097,6 +1132,20 @@ func cmdRecord(_ json: String) async {
     windowID: w.windowID, outDir: URL(fileURLWithPath: out), fps: fps, bitrate: bitrate,
     pointer: req["pointer"] as? Bool ?? true, frames: req["frames"] as? Bool ?? false,
     appName: w.owningApplication?.applicationName ?? "", appID: w.owningApplication?.bundleIdentifier ?? "")
+  if !maskSpecs.isEmpty {
+    progress.at("finding what the take covers")
+    let masks = Masks(pid: pid, windowID: w.windowID, specs: maskSpecs)
+    // Read before the capture starts: what is on screen now is covered from the first frame.
+    masks.begin()
+    for (i, n) in masks.matched.enumerated() where n == 0 {
+      emit([
+        "event": "notice", "code": "mask-unmatched",
+        "message":
+          "The mask \(maskSpecs[i].selector ?? "") matches nothing in the window now. It is covered from the moment it appears, which can be a frame or two late.",
+      ])
+    }
+    rec.masks = masks
+  }
   do {
     try await rec.start(content: content, window: w, filterKind: filterKind)
   } catch {
@@ -1184,9 +1233,44 @@ func requestedWindow(_ req: [String: Any], _ content: SCShareableContent) -> SCW
   return pool.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
 }
 
-/// Gives the window a size, keeping its top-left corner where it is, and waits for it to take.
+/// The part of a screen a window may use (no menu bar, no Dock), in global points with a
+/// top-left origin: the screen that holds most of `frame`, else the main one.
+func usableScreen(for frame: CGRect) -> CGRect? {
+  guard let primary = NSScreen.screens.first else { return nil }
+  func global(_ r: CGRect) -> CGRect {
+    CGRect(x: r.minX, y: primary.frame.height - r.maxY, width: r.width, height: r.height)
+  }
+  let best = NSScreen.screens.max { a, b in
+    let ia = global(a.frame).intersection(frame)
+    let ib = global(b.frame).intersection(frame)
+    return ia.width * ia.height < ib.width * ib.height
+  }
+  return global((best ?? primary).visibleFrame)
+}
+
+/// Where a window of `size` goes so that it is whole on its screen: where it is when it
+/// fits there, else moved up and left by what would hang over, never past the screen's
+/// own top-left corner.
+func originThatFits(_ origin: CGPoint, size: CGSize, in screen: CGRect) -> CGPoint {
+  var o = origin
+  if o.x + size.width > screen.maxX { o.x = screen.maxX - size.width }
+  if o.y + size.height > screen.maxY { o.y = screen.maxY - size.height }
+  return CGPoint(x: max(screen.minX, o.x), y: max(screen.minY, o.y))
+}
+
+/// Gives the window a size and waits for it to take. Its top-left corner stays where it is
+/// when the size fits on the screen from there; otherwise the window is moved first, by what
+/// would hang over: the system clips a window to its screen, and the take would be smaller
+/// than it was asked to be.
 func resizeWindow(pid: pid_t, frame: CGRect, to size: CGSize) -> Bool {
   guard let window = windowElement(pid, frame: frame) else { return false }
+  if let screen = usableScreen(for: frame) {
+    var origin = originThatFits(frame.origin, size: size, in: screen)
+    if origin != frame.origin, let value = AXValueCreate(.cgPoint, &origin) {
+      AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
+      usleep(120_000)
+    }
+  }
   var wanted = size
   guard let value = AXValueCreate(.cgSize, &wanted),
     AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value) == .success

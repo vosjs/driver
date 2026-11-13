@@ -63,6 +63,28 @@ console.log(stopped.durationMs, stopped.files.recording)
 | `filter`     | `'others-out'` | How the window is scoped. Leave it alone; see [the filter](#the-filter).                                         |
 | `drive`      | `false`        | A scripted take: bring the app to the front, then take commands. Needs Accessibility.                            |
 | `size`       |                | `{ w, h }` in points: give the window this size before the capture. Needs Accessibility.                         |
+| `mask`       |                | What the take keeps out of its pixels: `{ selector }` or `{ x, y, w, h }`. See [masks](#masks).                  |
+
+A window that would not fit on its screen at the size asked for is moved first, up and left by what would hang over: the system clips a window to its screen, and the take would come out smaller than it was asked to be.
+
+### Masks
+
+```ts
+record({
+  pid,
+  out: 'take',
+  mask: [
+    { selector: "popup[name*='Account']" }, // an element: every match of the selector
+    { x: 0, y: 760, w: 280, h: 40 }, // a rectangle of the window, in points
+  ],
+})
+```
+
+Each frame is covered where a mask is BEFORE it is encoded, so what was under a mask is in no file: not `recording.mp4`, not anything made from it. A cover is one flat colour, taken from the edge of what it covers, so it reads as an empty part of the interface and carries nothing of what was there.
+
+`ready.masks` says how many elements each mask covers as the take begins (a 0 also arrives as a `mask-unmatched` notice), and `stopped.masks` and `meta.json` say the most each covered at once. A selector needs Accessibility; a rectangle does not.
+
+**What a mask cannot promise.** An element is found by reading the app's accessibility tree, and its bounds are read again about thirty times a second. Something that appears or moves mid-take is covered from the next reading, so a frame or two can show it first. A place stays covered for a quarter of a second after its element leaves it. What must never show is on screen before the take begins, or is given as a rectangle.
 
 `options.onEvent` receives every line the helper prints. `options.signal` ends the take as `stop()` does.
 
@@ -103,6 +125,8 @@ A **selector** is a short path of steps. Each step is a role, then what the elem
 | `toolbar > button[name='Share']` | `>` is a child; a space is any descendant.                 |
 | `button[name='Delete']:nth(1)`   | The second match, counted from 0.                          |
 | `*[id='sidebar']`                | Any role.                                                  |
+
+`selectorProblem(text)` says why a selector is not one, in the helper's own words, or `null`. It runs without the helper, so a script's selectors can be checked when the script is read and not at the step that uses one.
 
 A role is the accessibility role in lower case without its `AX` (`button`, `checkbox`, `textfield`, `textarea`, `link`, `menuitem`, `row`, `cell`), with `text` for static text, `radio` for a radio button and `popup` for a pop-up button. `tree` proposes one selector per element, the identifier first because it is the one that survives a redesign, and says whether it names that element alone. It leaves out the window's own close, minimise and zoom buttons: pressing one ends the take.
 
@@ -191,10 +215,10 @@ This is the take the vos CLI reads, from `@vosjs/cli` 0.87.1: `npx vos plan take
 
 ## Permissions
 
-| Grant            | Needed for                                                                                                 |
-| ---------------- | ---------------------------------------------------------------------------------------------------------- |
-| Screen Recording | Everything but `check` and `version`.                                                                      |
-| Accessibility    | `tree`, a scripted take (`drive`, `size`, every command), and `frames: true`. A performed take needs none. |
+| Grant            | Needed for                                                                                                                       |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Screen Recording | Everything but `check` and `version`.                                                                                            |
+| Accessibility    | `tree`, a scripted take (`drive`, `size`, every command), a `mask` by selector, and `frames: true`. A performed take needs none. |
 
 Never Input Monitoring: the helper posts input, it does not listen to it.
 

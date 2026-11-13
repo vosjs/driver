@@ -3,7 +3,7 @@
 // what was done to them. It takes no focus by itself and shows no Dock icon. Its one menu is
 // Edit, with Select All.
 //
-//   window [--color r,g,b] [--title text]
+//   window [--color r,g,b] [--title text] [--resizable yes]
 //
 // The controls, each with an accessibility identifier:
 //   button "Save"         id save       each press adds one to the label beside it
@@ -16,13 +16,15 @@
 //                                       picture can see of a press
 //
 // It prints {"window": <id>} once it is on screen. On stdin, `move <dx> <dy>` moves it by
-// that many points (right and down) and prints {"moved": true}; `state` prints what was done
+// that many points (right and down) and prints {"moved": true}; `corner` puts it in the far
+// corner of the screen's usable part and `home` back where it opened; `state` prints what was done
 // to it: {"clicks": n, "typed": n, "remember": bool, "again": n, "held": "Shift"}, where
 // `held` is the modifier keys the system believes are down. It exits when stdin closes.
 import AppKit
 
 var color: [CGFloat] = [40, 90, 160]
 var title = "vos-driver fixture"
+var resizable = false
 var args = Array(CommandLine.arguments.dropFirst())
 while args.count >= 2 {
   let flag = args.removeFirst()
@@ -32,6 +34,8 @@ while args.count >= 2 {
     if parts.count == 3 { color = parts }
   } else if flag == "--title" {
     title = value
+  } else if flag == "--resizable" {
+    resizable = value == "yes"
   }
 }
 let fill = NSColor(srgbRed: color[0] / 255, green: color[1] / 255, blue: color[2] / 255, alpha: 1)
@@ -131,7 +135,7 @@ mainMenu.addItem(editItem)
 app.mainMenu = mainMenu
 
 let window = NSWindow(
-  contentRect: NSRect(x: 120, y: 160, width: 480, height: 320), styleMask: [.titled, .closable],
+  contentRect: NSRect(x: 120, y: 160, width: 480, height: 320), styleMask: resizable ? [.titled, .closable, .resizable] : [.titled, .closable],
   backing: .buffered, defer: false)
 window.title = title
 let field = Field(frame: window.contentView!.bounds)
@@ -150,6 +154,7 @@ DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
   fflush(stdout)
 }
 Thread.detachNewThread {
+  let home = DispatchQueue.main.sync { window.frame.origin }
   while let line = readLine() {
     let parts = line.split(separator: " ")
     if parts.count == 3, parts[0] == "move", let dx = Double(parts[1]), let dy = Double(parts[2]) {
@@ -159,6 +164,20 @@ Thread.detachNewThread {
         origin.x += dx
         origin.y -= dy
         window.setFrameOrigin(origin)
+        print("{\"moved\":true}")
+        fflush(stdout)
+      }
+    } else if parts.first == "corner" || parts.first == "home" {
+      let toCorner = parts.first == "corner"
+      DispatchQueue.main.async {
+        // The far corner of the screen's usable part, where a larger size would not fit; or
+        // back to where the window opened.
+        if toCorner, let screen = window.screen ?? NSScreen.main {
+          let v = screen.visibleFrame
+          window.setFrameOrigin(NSPoint(x: v.maxX - window.frame.width, y: v.minY))
+        } else {
+          window.setFrameOrigin(home)
+        }
         print("{\"moved\":true}")
         fflush(stdout)
       }
