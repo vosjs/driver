@@ -14,7 +14,7 @@ export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export function has(command) {
   try {
-    execFileSync('which', [command], { stdio: 'ignore' })
+    execFileSync('which', [command], { stdio: 'ignore', timeout: 10_000 })
     return true
   } catch {
     return false
@@ -133,6 +133,10 @@ function builtTools() {
         ['-O', join(root, 'Fixtures', `${name}.swift`), '-o', join(dir, name)],
         {
           stdio: ['ignore', 'ignore', 'pipe'],
+          // A synchronous call holds this whole process: no timer of the test file can fire
+          // while it runs. So it has a limit of its own, and a stall here fails by name.
+          timeout: 180_000,
+          killSignal: 'SIGKILL',
         },
       )
     }
@@ -212,7 +216,8 @@ export function probe(recording, seconds, ...rects) {
   const out = execFileSync(
     builtTools().probe,
     [recording, String(seconds), ...rects.map((r) => r.join(','))],
-    { encoding: 'utf8' },
+    // Reading a frame can stall on a file the system does not like; see builtTools.
+    { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' },
   )
   return JSON.parse(out).colors
 }
