@@ -212,6 +212,40 @@ describe('recording a window', { skip }, () => {
     },
   )
 
+  it('holds the display awake for the take, and lets go when it ends', TEST, async () => {
+    const held = () =>
+      execFileSync('pmset', ['-g', 'assertions'], { encoding: 'utf8' }).includes(
+        'vos-driver is recording a take',
+      )
+    assert.equal(held(), false, 'before the take')
+    const t = start({ window: fixture.id, out: out(), pointer: false })
+    const ready = await t.ready()
+    assert.equal(ready.awake, true)
+    // A take that waits is idle to the system: this is what keeps the screen from locking.
+    assert.equal(held(), true, 'during the take')
+    await sleep(300)
+    await t.stop()
+    await sleep(200)
+    assert.equal(held(), false, 'after the take')
+  })
+
+  it('says which appearance the take was made in, and the take keeps it', TEST, async () => {
+    const t = start({ window: fixture.id, out: out(), pointer: false })
+    const ready = await t.ready()
+    let dark = false
+    try {
+      dark = /dark/i.test(
+        execFileSync('defaults', ['read', '-g', 'AppleInterfaceStyle'], { encoding: 'utf8' }),
+      )
+    } catch {
+      // the key is absent when the appearance is light
+    }
+    assert.equal(ready.appearance, dark ? 'dark' : 'light')
+    await sleep(300)
+    const stopped = await t.stop()
+    assert.equal(readJson(stopped.files.meta).appearance, ready.appearance)
+  })
+
   it('says how round the window is, and the take keeps it', TEST, async () => {
     const t = start({ window: fixture.id, out: out(), pointer: false })
     const ready = await t.ready()
