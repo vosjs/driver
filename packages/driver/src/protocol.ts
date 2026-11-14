@@ -197,6 +197,8 @@ export type CommandFailureCode =
   | 'not-in-view'
   /** The app could not be brought to the front, so input would go to another one. */
   | 'not-frontmost'
+  /** The screen is locked: nothing can come to the front until a person unlocks it. */
+  | 'screen-locked'
   /** The take has not begun: wait for `ready`. */
   | 'not-ready'
   | 'accessibility'
@@ -292,6 +294,16 @@ export interface ReadyEvent {
    * were given. A 0 also arrives as a `mask-unmatched` notice.
    */
   masks?: number[]
+  /**
+   * The display is held awake until the take ends, so a take that waits (and sends no input
+   * while it does) does not let the screen sleep and lock. False when the system refused.
+   */
+  awake?: boolean
+  /**
+   * The system's appearance as the take began, which apps follow. It is also in `meta.json`:
+   * takes made under both do not cut into one film that matches itself.
+   */
+  appearance?: 'light' | 'dark'
 }
 
 /** Why a take ended. */
@@ -367,6 +379,8 @@ export type HelperErrorCode =
   | 'no-window'
   /** The capture could not start, or the system did not answer in time. */
   | 'start-failed'
+  /** The screen is locked, and the request drives the app: unlock it and run again. */
+  | 'screen-locked'
   /** The take ended before the window produced a frame. */
   | 'no-frames'
   /** The recording or its files could not be written. */

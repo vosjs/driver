@@ -320,6 +320,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   /// The radius of the window's own rounded corners, in points; 0 when it has none or it
   /// could not be read. Outside it the recording is opaque black.
   var cornerRadius = 0.0
+  /// The display, held awake from the capture's start to its end.
+  var awake: Awake?
+  /// The system's appearance as the take began.
+  let appearance = systemAppearance()
 
   // track
   var events: [[String: Any]] = []
@@ -471,9 +475,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "event": "ready", "protocol": PROTOCOL, "window": Int(windowID), "app": appName,
       "frame": ["x": frame.minX, "y": frame.minY, "w": frame.width, "h": frame.height],
       "scale": scale, "captureWidth": w, "captureHeight": h, "filter": filterKind,
-      "accessibility": AXIsProcessTrusted(),
+      "accessibility": AXIsProcessTrusted(), "appearance": appearance,
     ]
     if let masks { readyEvent["masks"] = masks.matched }
+    // Awake from here to the end of the take: a wait inside a take is idle to the system.
+    let held = Awake()
+    awake = held
+    readyEvent["awake"] = held.held
     let s = SCStream(filter: filter, configuration: config, delegate: self)
     try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQ)
     stream = s
@@ -902,6 +910,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     timer?.cancel()
     watcher?.cancel()
     masks?.end()
+    awake?.release()
     // A capture that will not stop must not keep the take from being written.
     if let s = stream {
       do {
@@ -958,7 +967,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "width": Int(pointSize.width.rounded()), "height": Int(pointSize.height.rounded()),
       "fps": fps, "captureWidth": pixelSize.w, "captureHeight": pixelSize.h,
       "captureSurface": "app", "platform": "mac", "producer": "desktop",
-      "app": ["name": appName, "id": appID],
+      "app": ["name": appName, "id": appID], "appearance": appearance,
     ]
     if resized { meta["resizedDuringTake"] = true }
     if cornerRadius > 0 { meta["cornerRadius"] = r1(cornerRadius) }
@@ -1121,8 +1130,12 @@ func cmdRecord(_ json: String) async {
     w = again
   }
   if drives {
+    // Behind a locked screen nothing can come forward: said as what it is, before anything
+    // is tried.
+    if screenIsLocked() { fail("screen-locked", SCREEN_LOCKED) }
     progress.at("bringing the app to the front")
     guard bringForward(pid: pid, window: windowElement(pid, frame: w.frame)) else {
+      if screenIsLocked() { fail("screen-locked", SCREEN_LOCKED) }
       fail("start-failed", "The app could not be brought to the front, so a script's input would go to another one.")
     }
     usleep(250_000)

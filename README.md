@@ -204,12 +204,17 @@ take/
   "captureHeight": 844,
   "dpr": 2,
   "cornerRadius": 18.2,
+  "appearance": "light",
   "zoom": 1,
   "fps": 60,
   "t0": 1794475400000,
   "durationMs": 6692
 }
 ```
+
+`appearance` is the system's as the take began (`light` or `dark`), which apps follow: takes made under both do not cut into one film that matches itself.
+
+**A take keeps the display awake.** From its first frame to its last the helper holds the assertion `caffeinate -d` takes, so a take that waits (a build, a render, an agent working) does not let the display sleep and the screen lock under it. `ready.awake` says it is held. Behind a locked screen nothing can be brought forward: a request that drives the app fails with `screen-locked` and says so.
 
 This is the take the vos CLI reads, from `@vosjs/cli` 0.87.1: `npx vos plan take` writes its `doc.json` with the zooms planned from the track.
 
@@ -252,6 +257,7 @@ Every failure is a `DriverError` with a `code`.
 | `bad-request`          | The request is not what the verb takes.                                   |
 | `no-window`            | No window on screen matches the request.                                  |
 | `start-failed`         | The capture could not start.                                              |
+| `screen-locked`        | The screen is locked, and the request drives the app. Unlock it.          |
 | `no-frames`            | The take ended before the window drew a frame.                            |
 | `write-failed`         | The recording or its files could not be written.                          |
 | `crashed`              | The helper ended without saying why.                                      |

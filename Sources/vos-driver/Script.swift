@@ -108,7 +108,9 @@ final class Driver: @unchecked Sendable {
   func forward() throws {
     if frontmostPid() == pid { return }
     let f = try frame()
+    if screenIsLocked() { throw InputError(code: "screen-locked", message: SCREEN_LOCKED) }
     guard bringForward(pid: pid, window: windowElement(pid, frame: f)) else {
+      if screenIsLocked() { throw InputError(code: "screen-locked", message: SCREEN_LOCKED) }
       throw InputError(code: "not-frontmost", message: "The app could not be brought to the front, so input would go to another one.")
     }
     usleep(200_000)
