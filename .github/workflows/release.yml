@@ -6,7 +6,7 @@
 #
 # The tag must name the version the tree says (the two packages and the Swift
 # source agree on one), and its commit must be on main: scripts/check-release.mjs.
-# The steps are in the README, under Release.
+# The steps are in CONTRIBUTING.md, under Release.
 #
 # The build and the publish are TWO JOBS, because the OIDC token is minted for a
 # job and every line that runs in that job can ask for it. The build job holds a
