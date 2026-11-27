@@ -224,7 +224,8 @@ final class Masks: @unchecked Sendable {
     guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &made) == kCVReturnSuccess, let out = made,
       CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_32BGRA,
       CVPixelBufferGetWidth(source) == CVPixelBufferGetWidth(out),
-      CVPixelBufferGetHeight(source) == CVPixelBufferGetHeight(out)
+      // A floating stage's file is taller than its picture: the picture is its top.
+      CVPixelBufferGetHeight(source) <= CVPixelBufferGetHeight(out)
     else { return nil }
     CVPixelBufferLockBaseAddress(source, .readOnly)
     CVPixelBufferLockBaseAddress(out, [])
@@ -234,7 +235,7 @@ final class Masks: @unchecked Sendable {
     }
     guard let from = CVPixelBufferGetBaseAddress(source), let to = CVPixelBufferGetBaseAddress(out) else { return nil }
     let w = CVPixelBufferGetWidth(out)
-    let h = CVPixelBufferGetHeight(out)
+    let h = CVPixelBufferGetHeight(source)
     let fromStride = CVPixelBufferGetBytesPerRow(source)
     let toStride = CVPixelBufferGetBytesPerRow(out)
     if fromStride == toStride {

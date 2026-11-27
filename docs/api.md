@@ -70,14 +70,15 @@ record({
 })
 ```
 
-| Field     | Default |                                                                                                 |
-| --------- | ------- | ----------------------------------------------------------------------------------------------- |
-| `apps`    |         | The apps on the stage, each by name or bundle id. Every running instance of a name is on it.    |
-| `pids`    |         | The processes on the stage. A process id tells two instances of one app apart.                  |
-| `stage`   | `false` | With `app` or `pid`: a stage of that one app's every window, not a take of its largest.         |
-| `desk`    | `[]`    | Parts of the desk to keep: `'menubar'`, `'dock'`, `'wallpaper'`.                                |
-| `display` |         | A display id. Default the display that holds most of the named apps' windows.                   |
-| `ground`  |         | `#rrggbb`, painted where the stage holds nothing. Default a neutral of the system's appearance. |
+| Field     | Default |                                                                                                   |
+| --------- | ------- | ------------------------------------------------------------------------------------------------- |
+| `apps`    |         | The apps on the stage, each by name or bundle id. Every running instance of a name is on it.      |
+| `pids`    |         | The processes on the stage. A process id tells two instances of one app apart.                    |
+| `stage`   | `false` | With `app` or `pid`: a stage of that one app's every window, not a take of its largest.           |
+| `desk`    | `[]`    | Parts of the desk to keep: `'menubar'`, `'dock'`, `'wallpaper'`.                                  |
+| `display` |         | A display id. Default the display that holds most of the named apps' windows.                     |
+| `ground`  |         | `#rrggbb`, painted where the stage holds nothing. Default a neutral of the system's appearance.   |
+| `float`   | `false` | Nothing behind the windows: the file carries their shape as a matte. Not with `ground` or `desk`. |
 
 `out`, `fps`, `bitrate`, `maxSeconds`, `pointer` and `frames` mean what they do for a window.
 
@@ -116,6 +117,8 @@ await take.send({
 **A picture first.** `still({ apps, out })` takes one picture of the stage as a take would show it, and answers with `windows`: where each app's windows are on it. `tree({ app })` is each app's outline, in its own window's points.
 
 `size`, `window` and `filter` are refused with a stage, in words.
+
+**A floating stage.** With `float: true` nothing is painted where the stage holds nothing. The file is H.264, which carries no transparency, so its frame holds two things: the picture on top, the take's size as any stage's (black where nothing is), and under it a strip holding the matte, which says how much of each pixel of the picture is a window (white) or nothing (black). `ready` and `meta.json` say where it stands (`matte`): it is `w` by `h` pixels of its own standing for the whole picture, cut into `bands` bands of `bandHeight` rows laid side by side from the left, starting at row `y` of the file; `height` is the file's whole height. The matte is sized so the file stays inside H.264 level 5.2 at the take's frame rate where the display allows it. Whoever plays the take draws the picture through the matte; played as it is, the file shows the windows on black with the strip under them.
 
 **A kept menu bar and the system's mark.** While a screen is recorded the system shows its own mark in the menu bar: an item among the status items, and a dot at the bar's far end. A stage that keeps the bar (`desk: ['menubar']`) keeps both out of its picture. The dot is a window of its own and is excluded. The item is found through accessibility by what the system calls it and covered before a frame is encoded, as a mask covers; no frame is kept until it is covered, so the take begins up to a second and a half later. Without Accessibility, or where a macOS calls the item something this helper does not know, a `mark-uncovered` notice says the mark may be in the picture. Everything else in a kept bar is in it: other apps' items, the clock.
 

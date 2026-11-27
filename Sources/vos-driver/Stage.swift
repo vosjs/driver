@@ -54,6 +54,8 @@ struct Stage {
   /// The part of the display the take is of, in global points with a top-left origin.
   let rect: CGRect
   let ground: CGColor
+  /// Nothing behind the windows: the take carries their shape as a matte (see Float.swift).
+  let floats: Bool
 }
 
 /// Which part of the desk a window at this level is, if it is one. The levels are the
@@ -151,12 +153,14 @@ func requestedStage(_ req: [String: Any], _ content: SCShareableContent, appeara
         x: rect.minX, y: bar.frame.maxY, width: rect.width, height: rect.maxY - bar.frame.maxY)
     }
   }
-  guard let ground = parseGround(req["ground"], appearance: appearance) else {
+  let floats = req["float"] as? Bool ?? false
+  guard let painted = parseGround(req["ground"], appearance: appearance) else {
     fail("bad-request", "ground is a colour like \"#1e1e1e\".")
   }
+  let ground = floats ? CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0) : painted
   return Stage(
     pids: pids, apps: apps, names: names, ids: ids, desk: desk, displayID: display.displayID, rect: rect,
-    ground: ground)
+    ground: ground, floats: floats)
 }
 
 /// The stage a request names, waited for as a window is.
@@ -277,6 +281,12 @@ extension Recorder {
             "The menu bar is kept, and the mark the system adds to it while a screen is recorded will be in the picture: finding it to cover it needs Accessibility, which is not granted.",
         ])
       }
+    }
+    // A floating stage writes its frames itself, the matte under the picture.
+    if stage.floats, masks == nil {
+      let cover = Masks(pid: 0, windowID: 0, specs: [], stage: stage)
+      cover.begin()
+      masks = cover
     }
     // Always said: a filter left to choose its own rectangle does not always choose the display's.
     appliedRect = CGRect(

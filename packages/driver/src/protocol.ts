@@ -32,6 +32,23 @@ export type CaptureFilter = 'others-out' | 'window' | 'app' | 'display-window' |
 export type DeskPart = 'menubar' | 'dock' | 'wallpaper'
 
 /**
+ * A floating stage's file, in its own pixels. The picture is the top `y` rows, as wide as
+ * the file. The matte says how much of each of the picture's pixels is a window: white is
+ * all of it, black none. It is `w` by `h` pixels of its own, standing for the whole picture,
+ * and is cut into `bands` bands of `bandHeight` rows laid side by side from the left under
+ * the picture: band n starts at x `n * w`, y `y`, and holds the matte's rows from
+ * `n * bandHeight`. `height` is the file's whole height.
+ */
+export interface Matte {
+  y: number
+  w: number
+  h: number
+  bands: number
+  bandHeight: number
+  height: number
+}
+
+/**
  * What `record` is asked for. Give `window`, `pid` or `app` for a take of one window; give
  * `apps` or `pids` (or `app` with `stage`) for a stage.
  *
@@ -73,6 +90,11 @@ export interface RecordRequest {
    * neutral of the system's appearance.
    */
   ground?: string
+  /**
+   * A stage: nothing behind the windows. The file then holds the picture with a MATTE under
+   * it, and `ready` says where (`matte`). Not given with `ground` or `desk`.
+   */
+  float?: boolean
   /** A directory. `recording.mp4`, `cursor.json` and `meta.json` are written there. */
   out: string
   /** The frame-rate ceiling, 1 to 120. Default 60. Frames arrive only when pixels change. */
@@ -361,6 +383,8 @@ export interface ReadyEvent {
   desk?: DeskPart[]
   /** A stage: the display it is of. */
   display?: number
+  /** A floating stage: where the matte stands in the file. */
+  matte?: Matte
   accessibility: boolean
   /**
    * The radius of the window's own rounded corners, in points; 0 when they are square or

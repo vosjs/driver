@@ -322,6 +322,56 @@ describe('recording a stage', { skip }, () => {
     assert.ok(!isGround(atGround), `the desk is there, not the ground: ${atGround}`)
   })
 
+  it('a floating stage carries its windows and, under them, their matte', TEST, async () => {
+    const t = start({
+      pids: [listed.blue.pid, listed.red.pid],
+      float: true,
+      out: out(),
+      pointer: false,
+    })
+    const ready = await t.ready()
+    const m = ready.matte
+    assert.ok(m, 'ready says where the matte stands')
+    // The picture is the take's size, as any stage's; the file is taller by the matte's strip.
+    assert.equal(m.y, ready.captureHeight)
+    assert.ok(m.height > m.y && m.height % 2 === 0)
+    assert.ok(m.bands * m.w <= ready.captureWidth, 'the bands stand side by side inside the frame')
+    assert.ok(m.bands * m.bandHeight >= m.h, 'the bands hold every row of the matte')
+    await sleep(700)
+    const stopped = await t.stop()
+    assert.deepEqual(readJson(stopped.files.meta).matte, m)
+
+    // Where a rectangle of the picture stands in the matte's strip, in the file's pixels.
+    const inMatte = ([x, y, w, h]) => {
+      const sx = m.w / ready.captureWidth
+      const sy = m.h / m.y
+      const my = Math.round(y * sy)
+      const band = Math.floor(my / m.bandHeight)
+      // Kept to the rows of one band: a rectangle across two is in two places.
+      const rows = Math.max(1, Math.min(Math.round(h * sy), (band + 1) * m.bandHeight - my))
+      return [
+        band * m.w + Math.round(x * sx),
+        m.y + (my % m.bandHeight),
+        Math.max(1, Math.round(w * sx)),
+        rows,
+      ]
+    }
+    const blue = patch(ready, listed.blue.frame)
+    const nothing = [20, 20, 40, 40]
+    const [atBlue, atNothing, matteBlue, matteNothing] = probe(
+      stopped.files.recording,
+      0.3,
+      blue,
+      nothing,
+      inMatte(blue),
+      inMatte(nothing),
+    )
+    assert.ok(atBlue[2] > 140 && atBlue[0] < 90, `the window is in the picture: ${atBlue}`)
+    assert.ok(Math.max(...atNothing) < 12, `where nothing is, the picture is black: ${atNothing}`)
+    assert.ok(Math.min(...matteBlue) > 235, `the matte is white where the window is: ${matteBlue}`)
+    assert.ok(Math.max(...matteNothing) < 20, `and black where nothing is: ${matteNothing}`)
+  })
+
   it('refuses in words what a stage does not do', TEST, async () => {
     const refused = async (request, code, words) => {
       const t = start({ out: out(), pointer: false, ...request })
@@ -336,6 +386,8 @@ describe('recording a stage', { skip }, () => {
     await refused({ pids, size: { w: 800, h: 600 } }, 'bad-request', /does not size/)
     await refused({ pids, window: listed.blue.id }, 'bad-request', /takes no one window/)
     await refused({ pids, desk: ['sky'] }, 'bad-request', /Unknown part of the desk/)
+    await refused({ pids, float: true, ground: GROUND }, 'bad-request', /has no ground/)
+    await refused({ pids, float: true, desk: ['dock'] }, 'bad-request', /keeps no part of the desk/)
     await refused({ apps: ['no app is called this'] }, 'no-window', /No running app is named/)
     if (accessible) {
       // An element is some app's: on a stage of several, a mask says whose.

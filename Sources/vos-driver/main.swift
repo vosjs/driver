@@ -263,6 +263,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   /// What the take keeps out of its pixels (Mask.swift). With masks, every frame is copied,
   /// covered and handed to the writer through `adaptor`; without, frames go as they came.
   var masks: Masks?
+  /// Where a floating stage's matte stands in its file. Nil for every other take.
+  var matte: Matte?
   var adaptor: AVAssetWriterInputPixelBufferAdaptor?
 
   // The capture follows the window and keeps every other application out, for the whole
@@ -448,6 +450,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     w -= w % 2
     h -= h % 2
     pixelSize = (w, h)
+    // A floating stage's file is taller than its picture: the matte stands under it.
+    if stage?.floats ?? false { matte = Matte.layout(width: w, height: h, fps: fps) }
+    let fileH = h + (matte?.strip ?? 0)
 
     config.width = w
     config.height = h
@@ -472,7 +477,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       outputSettings: [
         AVVideoCodecKey: AVVideoCodecType.h264,
         AVVideoWidthKey: w,
-        AVVideoHeightKey: h,
+        AVVideoHeightKey: fileH,
         AVVideoCompressionPropertiesKey: [
           AVVideoAverageBitRateKey: bitrate,
           AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
@@ -488,7 +493,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         sourcePixelBufferAttributes: [
           kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
           kCVPixelBufferWidthKey as String: w,
-          kCVPixelBufferHeightKey as String: h,
+          kCVPixelBufferHeightKey as String: fileH,
         ])
     }
     writer.add(input)
@@ -511,6 +516,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "accessibility": AXIsProcessTrusted(), "appearance": appearance,
     ]
     if let masks { readyEvent["masks"] = masks.matched }
+    if let matte { readyEvent["matte"] = matte.json }
     if let stage {
       readyEvent["apps"] = stage.apps.map { ["name": $0.name, "id": $0.id] }
       readyEvent["desk"] = DESK_PARTS.filter { stage.desk.contains($0) }
@@ -597,7 +603,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     if let masks {
       // A frame that cannot be covered is not written: the picture keeps its last frame.
       if let adaptor, let pool = adaptor.pixelBufferPool, let pixels = CMSampleBufferGetImageBuffer(sb),
-        let covered = masks.covering(pixels, pool: pool, window: pointSize)
+        let covered = masks.covering(pixels, pool: pool, window: pointSize),
+        matte?.pack(pixels, into: covered) ?? true
       {
         written = adaptor.append(covered, withPresentationTime: at)
       }
@@ -1025,6 +1032,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       meta["app"] = nil
       meta["apps"] = stage.apps.map { ["name": $0.name, "id": $0.id] }
       meta["desk"] = DESK_PARTS.filter { stage.desk.contains($0) }
+      if let matte { meta["matte"] = matte.json }
       meta["windows"] = stageWindowsJSON(durationMs: durationMs)
     }
     if resized { meta["resizedDuringTake"] = true }
@@ -1148,6 +1156,13 @@ func cmdRecord(_ json: String) async {
       ("size", "A stage does not size a window: its windows are recorded where and as they are."),
       ("filter", "A stage has one scope: the display with everything that was not named kept out."),
     ]
+    if req["float"] as? Bool ?? false {
+      // Floating is the windows and nothing else: there is no ground to colour and no desk under them.
+      if req["ground"] is String { fail("bad-request", "A floating stage has no ground: float and ground are not given together.") }
+      if !((req["desk"] as? [String]) ?? []).isEmpty {
+        fail("bad-request", "A floating stage keeps no part of the desk: float and desk are not given together.")
+      }
+    }
     for (field, why) in refused where req[field] != nil && !(req[field] is NSNull) {
       fail("bad-request", why)
     }

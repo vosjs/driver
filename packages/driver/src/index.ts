@@ -18,6 +18,7 @@ export type {
   CommandResult,
   CommandTarget,
   DeskPart,
+  Matte,
   DriverEvent,
   DriverWindow,
   ErrorEvent,
