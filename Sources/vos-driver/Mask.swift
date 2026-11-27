@@ -50,6 +50,9 @@ final class Masks: @unchecked Sendable {
   private var most: [Int]
   /// What is covered now, in the window's points.
   private var covered: [CGRect] = []
+  /// Places the take covers by its own finding (the system's mark in a kept menu bar), in the
+  /// frame's points. Not part of what the take reports of its masks.
+  private var also: [CGRect] = []
   /// Places covered a moment ago, with the host time each stops being covered.
   private var trailing: [(rect: CGRect, until: Double)] = []
   private var searchAt = 0.0
@@ -140,7 +143,8 @@ final class Masks: @unchecked Sendable {
   func read() {
     guard let corner = origin() else { return }
     let held = locked(lock) { elements }
-    var next: [CGRect] = []
+    // What the take itself found to cover, beside what the request named.
+    var next: [CGRect] = locked(lock) { also }
     for (i, spec) in specs.enumerated() {
       if let r = spec.rect {
         next.append(r)
@@ -172,6 +176,12 @@ final class Masks: @unchecked Sendable {
   }
 
   func end() { timer?.cancel() }
+
+  /// Sets what the take covers by its own finding, and covers it from the next frame.
+  func cover(also rects: [CGRect]) {
+    locked(lock) { also = rects }
+    read()
+  }
 
   /// The interface is about to change (a script acted): look for new matches at once.
   func soon() { locked(lock) { searchAt = 0 } }

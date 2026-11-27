@@ -8,6 +8,7 @@
 // It runs where Screen Recording is granted to whatever launched the tests and swiftc is on
 // the path; anywhere else the suite says why it is skipped.
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { after, before, describe, it } from 'node:test'
 import { DriverError, check, record, still, windows } from '../dist/index.js'
@@ -251,6 +252,58 @@ describe('recording a stage', { skip }, () => {
     assert.ok(isRed(atRed), `the red window: ${atRed}`)
     assert.ok(isGround(atBlue), `where the blue window is on screen, the ground: ${atBlue}`)
   })
+
+  it(
+    'a kept menu bar does not carry the mark the system adds while a screen is recorded',
+    {
+      ...TEST,
+      skip:
+        (!accessible && 'Accessibility is not granted to the app that launched these tests') ||
+        (!has('ffmpeg') && 'ffmpeg is not installed, so the bar cannot be read frame by frame'),
+    },
+    async () => {
+      const notices = []
+      const t = start(
+        { pids: [listed.blue.pid], desk: ['menubar'], out: out(), pointer: false, ground: GROUND },
+        { onEvent: (e) => e.event === 'notice' && notices.push(e.code) },
+      )
+      const ready = await t.ready()
+      assert.deepEqual(ready.desk, ['menubar'])
+      // The frame is the whole display now: the bar's strip is in it.
+      assert.equal(ready.frame.y, 0)
+      await sleep(1500)
+      const stopped = await t.stop()
+      // Where this macOS calls the mark something this helper does not know, it says so.
+      if (notices.includes('mark-uncovered')) return
+      // Every frame's bar, its right half, a pixel a point: the system's mark is a saturated
+      // purple, among the status items and at the bar's far end.
+      const k = ready.captureWidth / ready.frame.w
+      const wide = Math.floor(ready.captureWidth / 2 / 8)
+      const crop = [wide * 8, Math.round(8 * k), ready.captureWidth - wide * 8, Math.round(12 * k)]
+      const raw = execFileSync(
+        'ffmpeg',
+        [
+          '-loglevel',
+          'error',
+          '-i',
+          stopped.files.recording,
+          '-vf',
+          `crop=${crop.join(':')},scale=${wide}:1`,
+          '-f',
+          'rawvideo',
+          '-pix_fmt',
+          'rgb24',
+          '-',
+        ],
+        { maxBuffer: 1 << 28, timeout: 60_000 },
+      )
+      let purple = 0
+      for (let i = 0; i + 2 < raw.length; i += 3) {
+        if (raw[i + 2] > raw[i] + 60 && raw[i + 2] > raw[i + 1] + 60) purple++
+      }
+      assert.equal(purple, 0, 'no frame shows the mark, the first included')
+    },
+  )
 
   it('keeps the wallpaper only when asked', TEST, async () => {
     const t = start({

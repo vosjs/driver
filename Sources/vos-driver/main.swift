@@ -68,6 +68,10 @@ let BEGIN_SECONDS = 20.0
 /// not going to be.
 let STRANGER_SECONDS = 2.0
 
+/// How long after a renewed exclusion list is accepted a frame may still arrive that was
+/// composed under the old one. Measured: one frame, so a few frame intervals are waited.
+let RENEWAL_SETTLE_SECONDS = 0.1
+
 /// No window's corners are rounder than this. A corner that reads rounder is a window that
 /// is black where it meets the black outside it, and says nothing about its shape.
 let CORNER_CEILING_POINTS = 40.0
@@ -359,6 +363,17 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   /// True from a press that began on the stage until it is let go.
   var pressOnStage = false
 
+  // The system's own mark in a kept menu bar (Stage.swift): found once the capture has begun,
+  // and covered before a frame is encoded. On `watchQ`, but `markSettled`, behind `evLock`.
+  var wantsMark = false
+  var barBefore: [AXUIElement] = []
+  var markItems: [AXUIElement] = []
+  var markStart = 0.0
+  var nextMarkSearch = 0.0
+  /// True once the mark is covered, or was looked for long enough: frames go to the file.
+  var markSettled = false
+  var markHeld = 0
+
   let stopLock = NSLock()
   var finished = false
   /// What the process exits with once the take is over.
@@ -540,6 +555,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     let now = CACurrentMediaTime()
     // Another application's window over this one is not in the take, not for one frame: a
     // frame that may show one is held back, and the picture keeps its last clean frame.
+    // A kept menu bar shows the system's own mark of this very capture: no frame is kept
+    // until it is found and covered (or was looked for long enough to say it is not there).
+    if wantsMark, !locked(evLock, { markSettled }) {
+      markHeld += 1
+      return
+    }
     if excludesOthers {
       if let strangers = strangersOver() {
         held += 1
@@ -816,8 +837,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         let beyond: Set<CGWindowID> = locked(self.exLock) {
           if let applied {
             self.excluded = applied
-            // Frames taken before now were taken under the old list.
-            self.cleanFrom = since
+            // Frames taken before now were taken under the old list, and so is one already on
+            // its way when the new list was accepted: it arrives after this, still showing
+            // what was just excluded. Frames wait a moment longer than the call.
+            self.cleanFrom = since + RENEWAL_SETTLE_SECONDS
+            self.watchQ.asyncAfter(deadline: .now() + RENEWAL_SETTLE_SECONDS + 0.03) { self.nudge() }
           }
           var given = Set<CGWindowID>()
           for (id, firstSeen) in asked {

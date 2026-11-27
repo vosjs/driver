@@ -259,6 +259,25 @@ extension Recorder {
     // What is on the display now and cannot be excluded is known from the start, so a take
     // does not open by waiting on it.
     ignored = (windowsOver() ?? []).subtracting(excluded)
+    // A kept menu bar will show the system's mark of this capture. What is in the bar now is
+    // noted, so what the capture adds can be told from it and covered.
+    if stage.desk.contains("menubar") {
+      if AXIsProcessTrusted() {
+        wantsMark = true
+        barBefore = systemBarItems()
+        if masks == nil {
+          let cover = Masks(pid: 0, windowID: 0, specs: [], stage: stage)
+          cover.begin()
+          masks = cover
+        }
+      } else {
+        emit([
+          "event": "notice", "code": "mark-uncovered",
+          "message":
+            "The menu bar is kept, and the mark the system adds to it while a screen is recorded will be in the picture: finding it to cover it needs Accessibility, which is not granted.",
+        ])
+      }
+    }
     // Always said: a filter left to choose its own rectangle does not always choose the display's.
     appliedRect = CGRect(
       x: stage.rect.minX - display.frame.minX, y: stage.rect.minY - display.frame.minY, width: stage.rect.width,
@@ -282,6 +301,7 @@ extension Recorder {
   func watchStage() {
     guard !finished, let stage, let list = serverWindows() else { return }
     let now = CACurrentMediaTime()
+    if wantsMark { trackMark(stage, now) }
     let mine = stage.windows(in: list)
     let entry: [[String: Any]] = mine.map { w in
       var e: [String: Any] = [
@@ -389,6 +409,109 @@ extension Recorder {
     return Set(
       list.filter { $0.alpha > 0 && $0.bounds.intersects(stage.rect) && !stage.holds(pid: $0.pid, layer: $0.layer) }
         .map { $0.id })
+  }
+}
+
+// MARK: the system's mark in a kept menu bar
+
+/// How long after the capture begins the mark is looked for: it appears with the capture.
+let MARK_SEARCH_SECONDS = 3.0
+/// How long frames wait for it. Past this the take goes on and says the mark may be in it.
+let MARK_HOLD_SECONDS = 1.5
+/// Points covered each side of the mark's own item: it is drawn wider than the item says.
+let MARK_PAD: CGFloat = 14
+
+/// The processes that have owned the system's menu bar items, across the macOS versions run.
+let BAR_AGENTS = ["com.apple.MenuBarAgent", "com.apple.controlcenter", "com.apple.systemuiserver"]
+
+/// What the system calls the item it shows while a screen, a camera or a microphone is in use.
+let MARK_IDENTIFIERS: Set<String> = ["com.apple.menuextra.audiovideo"]
+
+/// A bar item's identifier: its own, or that of the menu extra it hosts.
+func barItemIdentifier(_ item: AXUIElement) -> String {
+  func id(_ el: AXUIElement) -> String {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, kAXIdentifierAttribute as CFString, &v) == .success else { return "" }
+    return v as? String ?? ""
+  }
+  let own = id(item)
+  if !own.isEmpty { return own }
+  var kids: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(item, kAXChildrenAttribute as CFString, &kids) == .success,
+    let first = (kids as? [AXUIElement])?.first
+  else { return "" }
+  return id(first)
+}
+
+/// The system's own status items in the menu bar, as accessibility has them.
+func systemBarItems() -> [AXUIElement] {
+  var out: [AXUIElement] = []
+  for app in NSWorkspace.shared.runningApplications where BAR_AGENTS.contains(app.bundleIdentifier ?? "") {
+    let el = AXUIElementCreateApplication(app.processIdentifier)
+    AXUIElementSetMessagingTimeout(el, 0.3)
+    var bar: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, "AXExtrasMenuBar" as CFString, &bar) == .success, let bar else { continue }
+    var kids: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(bar as! AXUIElement, kAXChildrenAttribute as CFString, &kids) == .success,
+      let items = kids as? [AXUIElement]
+    else { continue }
+    out.append(contentsOf: items)
+  }
+  return out
+}
+
+extension Recorder {
+  /// Finds the item the system added to the bar when this capture began, and keeps it
+  /// covered where it is: other items appearing move it.
+  func trackMark(_ stage: Stage, _ now: Double) {
+    if markStart == 0 { markStart = now }
+    if markItems.isEmpty, now - markStart < MARK_SEARCH_SECONDS, now >= nextMarkSearch {
+      nextMarkSearch = now + 0.15
+      let items = systemBarItems()
+      // By what the system calls it; and where a macOS calls it something else, by its
+      // having come into the bar after the capture began.
+      let named = items.filter { MARK_IDENTIFIERS.contains(barItemIdentifier($0)) }
+      let before = barBefore
+      markItems = named.isEmpty ? items.filter { item in !before.contains { CFEqual($0, item) } } : named
+    }
+    let settled = locked(evLock) { markSettled }
+    if !markItems.isEmpty {
+      let rects = markItems.compactMap(axRect).map { r in
+        r.insetBy(dx: -MARK_PAD, dy: 0).offsetBy(dx: -stage.rect.minX, dy: -stage.rect.minY)
+      }
+      masks?.cover(also: rects)
+      if !settled { settleMark(found: true) }
+    } else if !settled, now - markStart >= MARK_HOLD_SECONDS {
+      settleMark(found: false)
+    }
+  }
+
+  /// Lets frames through, and asks the capture for one: a stage that is still would
+  /// otherwise send none to begin the take with.
+  func settleMark(found: Bool) {
+    locked(evLock) { markSettled = true }
+    if !found {
+      emit([
+        "event": "notice", "code": "mark-uncovered",
+        "message":
+          "The mark the system adds to the menu bar while a screen is recorded was not found to cover. If it shows, it is in the picture.",
+      ])
+    }
+    nudge()
+  }
+
+  /// Asks the capture for a frame now. Frames come only when pixels change, so after frames
+  /// were held back a picture that is still would send no other, and a take that has not
+  /// begun would never begin. On `watchQ`.
+  func nudge() {
+    guard !finished, let s = stream else { return }
+    let config = self.config
+    Task {
+      _ = try? await limited("Asking the capture for a frame", seconds: 3) {
+        try await s.updateConfiguration(config)
+        return Handed(value: ())
+      }
+    }
   }
 }
 

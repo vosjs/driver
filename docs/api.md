@@ -117,7 +117,7 @@ await take.send({
 
 `size`, `window` and `filter` are refused with a stage, in words.
 
-A live capture of a display makes the system show its own sharing indicator in the menu bar. A stage that keeps the bar (`desk: ['menubar']`) has it in its pixels.
+**A kept menu bar and the system's mark.** While a screen is recorded the system shows its own mark in the menu bar: an item among the status items, and a dot at the bar's far end. A stage that keeps the bar (`desk: ['menubar']`) keeps both out of its picture. The dot is a window of its own and is excluded. The item is found through accessibility by what the system calls it and covered before a frame is encoded, as a mask covers; no frame is kept until it is covered, so the take begins up to a second and a half later. Without Accessibility, or where a macOS calls the item something this helper does not know, a `mark-uncovered` notice says the mark may be in the picture. Everything else in a kept bar is in it: other apps' items, the clock.
 
 ### Masks
 
