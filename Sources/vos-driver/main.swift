@@ -23,6 +23,9 @@
 //     "size": {"w":1200,"h":800},   give the window this size before the capture
 //     "filter": "others-out" } how the window is scoped; see FILTERS
 //
+// With "apps" or "pids" (or "app" and "stage": true) the request is for a STAGE: one display
+// with only the named apps' windows in its pixels. See Stage.swift.
+//
 // A take ends on `stop` and a newline on stdin, on SIGINT or SIGTERM, at maxSeconds, when the
 // capture stream stops, or when stdin is a pipe and it closes (the process that started this is
 // gone). End of input on a terminal, /dev/null or a file ends nothing.
@@ -347,6 +350,15 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     }
   }
 
+  // A stage (Stage.swift): one display with only what the take named in its pixels. Its
+  // windows' order and the track of where they were are behind `evLock`.
+  var stage: Stage?
+  var stageOrder: [ServerWindow] = []
+  var stageSignature = ""
+  var stageTrack: [(Double, [[String: Any]])] = []
+  /// True from a press that began on the stage until it is let go.
+  var pressOnStage = false
+
   let stopLock = NSLock()
   var finished = false
   /// What the process exits with once the take is over.
@@ -404,6 +416,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     } else {
       filter = SCContentFilter(desktopIndependentWindow: window)
     }
+    try await open(filter: filter, frame: frame, filterKind: filterKind, outside: outside)
+  }
+
+  /// Opens the recording file and starts the capture of `frame` (global points) through `filter`.
+  /// `outside` is painted where the filter holds nothing; the caller keeps it alive.
+  func open(filter: SCContentFilter, frame: CGRect, filterKind: String, outside: CGColor) async throws {
     scale = Double(filter.pointPixelScale)
     pointSize = frame.size
     var w = Int((frame.width * scale).rounded())
@@ -478,6 +496,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "accessibility": AXIsProcessTrusted(), "appearance": appearance,
     ]
     if let masks { readyEvent["masks"] = masks.matched }
+    if let stage {
+      readyEvent["apps"] = stage.apps.map { ["name": $0.name, "id": $0.id] }
+      readyEvent["desk"] = DESK_PARTS.filter { stage.desk.contains($0) }
+      readyEvent["display"] = Int(stage.displayID)
+    }
     // Awake from here to the end of the take: a wait inside a take is idle to the system.
     let held = Awake()
     awake = held
@@ -490,7 +513,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       return Handed(value: ())
     }
     progress.at("waiting for the window's first frame to reach the file")
-    startWatching()
+    if stage != nil { startStageWatch() } else { startWatching() }
 
     // A take with no frame in its file would leave the caller waiting on `ready` for good:
     // a window that never draws, or frames the writer will not take.
@@ -722,6 +745,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   /// The windows of anything else that overlap this one right now, as the window server has
   /// them. Nil when this window is not on screen.
   func windowsOver() -> Set<CGWindowID>? {
+    if let stage { return stageStrangers(stage) }
     guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
     else { return nil }
     var mine: CGRect?
@@ -777,7 +801,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       if let content = try? await limited("The list of windows on screen", seconds: 3, {
         Handed(value: try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true))
       }), let display = content.displays.first(where: { $0.displayID == self.displayID }) {
-        let others = content.windows.filter { $0.owningApplication?.processID != self.appPID }
+        let others =
+          self.stage?.others(content) ?? content.windows.filter { $0.owningApplication?.processID != self.appPID }
         let filter = SCContentFilter(display: display, excludingWindows: others)
         let updated: Void? = try? await limited("Keeping other windows out of the capture", seconds: 3) {
           try await s.updateContentFilter(filter)
@@ -845,6 +870,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   }
 
   func sample() {
+    if let stage { return sampleStage(stage) }
     guard let t0 = t0Host, !finished else { return }
     let t = (CACurrentMediaTime() - t0) * 1000
     guard t >= 0, let win = windowFrame(windowID), let pos = CGEvent(source: nil)?.location else { return }
@@ -969,6 +995,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "captureSurface": "app", "platform": "mac", "producer": "desktop",
       "app": ["name": appName, "id": appID], "appearance": appearance,
     ]
+    if let stage {
+      // A stage is a display, or what the take kept of one: several apps and no one window.
+      meta["captureSurface"] = "desktop"
+      meta["app"] = nil
+      meta["apps"] = stage.apps.map { ["name": $0.name, "id": $0.id] }
+      meta["desk"] = DESK_PARTS.filter { stage.desk.contains($0) }
+      meta["windows"] = stageWindowsJSON(durationMs: durationMs)
+    }
     if resized { meta["resizedDuringTake"] = true }
     if cornerRadius > 0 { meta["cornerRadius"] = r1(cornerRadius) }
     if let masks { meta["masks"] = masks.report }
@@ -1079,8 +1113,27 @@ func cmdRecord(_ json: String) async {
   guard bitrate >= 100_000 else { fail("bad-request", "bitrate is at least 100000.") }
   let maxSeconds = (req["maxSeconds"] as? NSNumber)?.doubleValue ?? 3600
   guard maxSeconds > 0 else { fail("bad-request", "maxSeconds is above 0.") }
-  guard req["window"] is Int || req["pid"] is Int || req["app"] is String else {
+  let staged = isStageRequest(req)
+  guard staged || req["window"] is Int || req["pid"] is Int || req["app"] is String else {
     fail("bad-request", "The request names no target: a window id, a process id, or an app's name or bundle id.")
+  }
+  if staged {
+    // What a stage does not do yet is refused in words, never left out silently.
+    let refused = [
+      ("window", "A stage is every window of the apps it names: it takes no one window."),
+      ("size", "A stage does not size a window: its windows are recorded where and as they are."),
+      ("filter", "A stage has one scope: the display with everything that was not named kept out."),
+      ("drive", "A stage takes no script yet: it is performed."),
+      ("mask", "A stage takes no mask yet: stage what must not be seen, or leave its app off the stage."),
+    ]
+    for (field, why) in refused where req[field] != nil && !(req[field] is NSNull) {
+      if field == "drive", req[field] as? Bool == false { continue }
+      if field == "mask", (req[field] as? [Any])?.isEmpty == true { continue }
+      fail("bad-request", why)
+    }
+    for part in (req["desk"] as? [String]) ?? [] where !DESK_PARTS.contains(part) {
+      fail("bad-request", "Unknown part of the desk \"\(part)\". One of: \(DESK_PARTS.joined(separator: ", ")).")
+    }
   }
 
   let maskSpecs: [Masks.Spec]
@@ -1106,6 +1159,23 @@ func cmdRecord(_ json: String) async {
   // is recorded, not at the first step.
   let drives = req["drive"] as? Bool ?? false
   if drives, !AXIsProcessTrusted() { fail("accessibility", ACCESSIBILITY_NEEDED) }
+
+  if staged {
+    progress.at("listing the screen's windows")
+    let rec = Recorder(
+      windowID: 0, outDir: URL(fileURLWithPath: out), fps: fps, bitrate: bitrate,
+      pointer: req["pointer"] as? Bool ?? true, frames: req["frames"] as? Bool ?? false, appName: "", appID: "")
+    let (content, found) = await awaitedStage(req, appearance: rec.appearance)
+    guard let stage = found else {
+      fail("no-window", "None of the apps the stage names has a window on screen.")
+    }
+    do {
+      try await rec.startStage(content: content, stage: stage)
+    } catch {
+      fail("start-failed", error.localizedDescription)
+    }
+    await finish(rec: rec, driver: nil, maxSeconds: maxSeconds)
+  }
 
   progress.at("listing the screen's windows")
   var (content, found) = await awaitedWindow(req)
@@ -1165,10 +1235,15 @@ func cmdRecord(_ json: String) async {
     fail("start-failed", error.localizedDescription)
   }
 
+  await finish(rec: rec, driver: Driver(rec: rec, pid: pid, windowID: w.windowID), maxSeconds: maxSeconds)
+}
+
+/// A take that has started, to its end: it ends on `stop`, a signal, the cap, or the process
+/// that started it going away, and the helper exits with what the take came to.
+func finish(rec: Recorder, driver: Driver?, maxSeconds: Double) async -> Never {
   DispatchQueue.global().asyncAfter(deadline: .now() + maxSeconds) { Task { await rec.stop(reason: "cap") } }
 
   let parentHoldsStdin = stdinIsPipe()
-  let driver = Driver(rec: rec, pid: pid, windowID: w.windowID)
   Thread.detachNewThread {
     while let line = readLine() {
       let text = line.trimmingCharacters(in: .whitespaces)
@@ -1182,6 +1257,10 @@ func cmdRecord(_ json: String) async {
         let cmd = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
       else {
         emit(["event": "result", "ok": false, "code": "bad-request", "message": "A line on stdin is `stop` or one JSON command."])
+        continue
+      }
+      guard let driver else {
+        emit(["event": "result", "ok": false, "code": "bad-request", "message": "A stage takes no commands yet: it is performed."])
         continue
       }
       emit(driver.run(cmd))

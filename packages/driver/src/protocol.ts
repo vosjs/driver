@@ -28,7 +28,24 @@ export interface Rect {
  */
 export type CaptureFilter = 'others-out' | 'window' | 'app' | 'display-window' | 'display'
 
-/** What `record` is asked for. Give `window`, `pid` or `app`. */
+/** A part of the desk a stage can keep. A stage keeps none unless it is asked to. */
+export type DeskPart = 'menubar' | 'dock' | 'wallpaper'
+
+/**
+ * What `record` is asked for. Give `window`, `pid` or `app` for a take of one window; give
+ * `apps` or `pids` (or `app` with `stage`) for a stage.
+ *
+ * A stage is one display with only what the request names in its pixels: every window of
+ * the named apps, where it is and in its real order, and the parts of the desk asked for.
+ * No other app, no wallpaper, no Dock and no menu bar is encoded. A window of a named app
+ * that is covered on screen by something un-named is recorded whole. The frame is the
+ * display, less the menu bar's strip when the bar is not kept; the pointer's track is in
+ * that frame's points, and it is silent while the pointer is over a window of an app the
+ * stage did not name. `meta.json` says `captureSurface: "desktop"`, `apps`, `desk` and
+ * `windows`: where each named app's windows were, front to back, every time that changed.
+ *
+ * A stage is performed: `drive`, `mask`, `size`, `window` and `filter` are refused with it.
+ */
 export interface RecordRequest {
   /** A window id from `windows()`. Wins over `pid` and `app`. */
   window?: number
@@ -36,6 +53,21 @@ export interface RecordRequest {
   pid?: number
   /** An application's name or bundle id: its largest titled window is recorded. */
   app?: string
+  /** A stage: the apps on it, each by name or bundle id. Every running instance of a name is on it. */
+  apps?: string[]
+  /** A stage: the processes on it. A process id tells two instances of one app apart. */
+  pids?: number[]
+  /** With `app` or `pid`: a stage of that one app's every window, not a take of its largest. */
+  stage?: boolean
+  /** A stage: the parts of the desk to keep. Default none. */
+  desk?: DeskPart[]
+  /** A stage: the display, by id. Default the one that holds most of the named apps' windows. */
+  display?: number
+  /**
+   * A stage: the colour painted where the stage holds nothing, as `#rrggbb`. Default a
+   * neutral of the system's appearance.
+   */
+  ground?: string
   /** A directory. `recording.mp4`, `cursor.json` and `meta.json` are written there. */
   out: string
   /** The frame-rate ceiling, 1 to 120. Default 60. Frames arrive only when pixels change. */
@@ -281,7 +313,14 @@ export interface ReadyEvent {
   scale: number
   captureWidth: number
   captureHeight: number
-  filter: CaptureFilter
+  /** `stage` for a stage. */
+  filter: CaptureFilter | 'stage'
+  /** A stage: the apps on it. `window` is then 0 and `app` empty. */
+  apps?: { name: string; id: string }[]
+  /** A stage: the parts of the desk it keeps. */
+  desk?: DeskPart[]
+  /** A stage: the display it is of. */
+  display?: number
   accessibility: boolean
   /**
    * The radius of the window's own rounded corners, in points; 0 when they are square or

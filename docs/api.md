@@ -59,6 +59,41 @@ console.log(stopped.durationMs, stopped.files.recording)
 
 A window that would not fit on its screen at the size asked for is moved first, up and left by what would hang over: the system clips a window to its screen, and the take would come out smaller than it was asked to be.
 
+### A stage
+
+A stage is one display with only what the request names in its pixels: every window of the named apps, where it is and in its real order.
+
+```ts
+record({
+  apps: ['Linear', 'com.apple.Terminal'], // names or bundle ids
+  out: 'take',
+})
+```
+
+| Field     | Default |                                                                                                 |
+| --------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `apps`    |         | The apps on the stage, each by name or bundle id. Every running instance of a name is on it.    |
+| `pids`    |         | The processes on the stage. A process id tells two instances of one app apart.                  |
+| `stage`   | `false` | With `app` or `pid`: a stage of that one app's every window, not a take of its largest.         |
+| `desk`    | `[]`    | Parts of the desk to keep: `'menubar'`, `'dock'`, `'wallpaper'`.                                |
+| `display` |         | A display id. Default the display that holds most of the named apps' windows.                   |
+| `ground`  |         | `#rrggbb`, painted where the stage holds nothing. Default a neutral of the system's appearance. |
+
+`out`, `fps`, `bitrate`, `maxSeconds`, `pointer` and `frames` mean what they do for a window.
+
+- **Nothing that was not named is encoded.** Not another app, not the wallpaper, not desktop icons, not the Dock, not the menu bar. A window of another app that opens over the stage mid-take is in no frame: frames it could be in are held back until it is excluded, as for a window.
+- **A named window covered on screen is recorded whole.** Whoever is at the machine can work in another app in front of the stage; the take does not show it.
+- **A panel another process draws for a named app is not that app's.** An Open or Save panel, a system prompt and a password sheet belong to their own processes and stay out.
+- **The frame is the display**, less the menu bar's strip when the bar is not kept, encoded at its pixel size up to 3840 wide. The pointer's track is in that frame's points.
+- **The pointer counts only on the stage.** While it is over a window of an app the take did not name, the track is silent. A press that began on the stage ends in the track wherever it is let go. The ground between the stage's windows is the stage's.
+- **Typing is counted only while a named app has the keyboard.**
+- **The desk's parts are found by their window level**, the system's own constants, never by who owns them or what they are called: both have changed between macOS versions.
+- **`meta.json`** says `captureSurface: "desktop"`, `apps` (name and bundle id of each), `desk`, and `windows`: `{ t, windows: [{ id, app, x, y, w, h, panel? }] }`, front to back, at the first frame and every time that changed. `panel` marks a window with no title: an alert, a popover, a tip, which is its app's window's and not a place of its own. A window is never named by its title.
+
+A stage is performed. `drive`, `mask`, `size`, `window` and `filter` are refused with it, in words.
+
+A live capture of a display makes the system show its own sharing indicator in the menu bar. A stage that keeps the bar (`desk: ['menubar']`) has it in its pixels.
+
 ### Masks
 
 ```ts
@@ -227,7 +262,7 @@ macOS grants these to the app that launched the helper. If `check()` says `scree
 - **Learn what was typed.** Typing is the system's count of key presses going up. No key a person presses ever reaches the helper, and there is no keyboard listener in it to receive one. The text a script types is the script's own: it is posted to the app and written nowhere.
 - **Read what is in a field.** The value of anything a person types into (a text field, a text area, a search field, a password field) is never read, by any verb. A field is called by its placeholder or its label.
 - **Read the interface unless asked.** `tree` and a command's selector read what the interface calls its elements: titles, descriptions, and the words of labels and other static text, which in some apps is content (a message in a list, a file's name). That goes to whoever called the helper and nowhere else. A performed take reads none of it; with `frames: true` it reads where things are, never what they say.
-- **Record anything but the one app.** Every window that is not the app's is excluded from the capture, which is cropped to the window and follows it when it moves. A window that opens over it mid-take (a notification, an app you launch) is excluded as soon as it appears, and the frames it could be in are held back, so it is not in the file for even one.
+- **Record what was not named.** A take of a window excludes every window that is not the app's, and is cropped to the window and follows it when it moves. A stage excludes every window that is not a named app's, and the desk with them. Neither can record a display as it is. A window that opens over it mid-take (a notification, an app you launch) is excluded as soon as it appears, and the frames it could be in are held back, so it is not in the file for even one.
 - **Name a window.** `meta.json` holds the app's name and bundle id, never a window title.
 - **Send anything anywhere.** The helper has no network code. It writes three files into the directory it was given.
 - **Sample on a timer, or keep running** after the process that started it is gone.
