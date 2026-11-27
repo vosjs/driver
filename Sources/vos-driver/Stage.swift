@@ -177,6 +177,9 @@ struct ServerWindow {
   let layer: Int
   let alpha: Double
   let bounds: CGRect
+  /// Whether it has a title. An app's alert, popover or tip is a window with none. The title
+  /// itself is never kept.
+  let titled: Bool
 }
 
 /// Every window on screen, front to back.
@@ -191,7 +194,8 @@ func serverWindows() -> [ServerWindow]? {
     return ServerWindow(
       id: id, pid: (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value ?? -1,
       layer: (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0,
-      alpha: (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1, bounds: bounds)
+      alpha: (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1, bounds: bounds,
+      titled: !((info[kCGWindowName as String] as? String) ?? "").isEmpty)
   }
 }
 
@@ -271,11 +275,15 @@ extension Recorder {
     let now = CACurrentMediaTime()
     let mine = stage.windows(in: list)
     let entry: [[String: Any]] = mine.map { w in
-      [
+      var e: [String: Any] = [
         "id": Int(w.id), "app": stage.names[w.pid] ?? "",
         "x": r1(w.bounds.minX - stage.rect.minX), "y": r1(w.bounds.minY - stage.rect.minY),
         "w": r1(w.bounds.width), "h": r1(w.bounds.height),
       ]
+      // An alert, a popover, a tip: a window of the app's with no title. What happens in one
+      // is happening in the app's window, and whoever reads the track can tell.
+      if !w.titled { e["panel"] = true }
+      return e
     }
     let signature = mine.map { "\($0.id):\(Int($0.bounds.minX)),\(Int($0.bounds.minY)),\(Int($0.bounds.width)),\(Int($0.bounds.height))" }
       .joined(separator: "|")

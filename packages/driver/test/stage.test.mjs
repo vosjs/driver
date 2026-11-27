@@ -183,6 +183,7 @@ describe('recording a stage', { skip }, () => {
       assert.equal(w.h, listed[key].frame.h)
       assert.equal(typeof w.app, 'string')
       assert.equal('title' in w, false, 'a window is never named by its title')
+      assert.equal('panel' in w, false, 'a titled window is a window, not a panel of one')
     }
 
     // The pixels: each named window where the list says, the window over the blue one

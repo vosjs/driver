@@ -88,7 +88,7 @@ record({
 - **The pointer counts only on the stage.** While it is over a window of an app the take did not name, the track is silent. A press that began on the stage ends in the track wherever it is let go. The ground between the stage's windows is the stage's.
 - **Typing is counted only while a named app has the keyboard.**
 - **The desk's parts are found by their window level**, the system's own constants, never by who owns them or what they are called: both have changed between macOS versions.
-- **`meta.json`** says `captureSurface: "desktop"`, `apps` (name and bundle id of each), `desk`, and `windows`: `{ t, windows: [{ id, app, x, y, w, h }] }`, front to back, at the first frame and every time that changed. A window is never named by its title.
+- **`meta.json`** says `captureSurface: "desktop"`, `apps` (name and bundle id of each), `desk`, and `windows`: `{ t, windows: [{ id, app, x, y, w, h, panel? }] }`, front to back, at the first frame and every time that changed. `panel` marks a window with no title: an alert, a popover, a tip, which is its app's window's and not a place of its own. A window is never named by its title.
 
 A stage is performed. `drive`, `mask`, `size`, `window` and `filter` are refused with it, in words.
 
