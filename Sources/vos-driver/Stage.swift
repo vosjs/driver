@@ -13,8 +13,12 @@
 //     "desk": ["menubar", "dock", "wallpaper"],        parts of the desk to keep; default none
 //     "display": 1,                                    a display id; default the one that holds
 //                                                      most of the named apps' windows
-//     "ground": "#1e1e1e" }                            what is painted where nothing is; default
+//     "ground": "#1e1e1e",                             what is painted where nothing is; default
 //                                                      a neutral of the system's appearance
+//     "drive": true,                                   scripted: commands on stdin, each naming
+//                                                      its app (StageDriver, below)
+//     "mask": [{"app": "Linear", "selector": "…"}] }   covered before a frame is encoded; an
+//                                                      element's mask names its app
 //
 // The frame is the display, less the menu bar's strip when the bar is not kept. The pointer's
 // track is in that frame's points. `meta.json` says `captureSurface: "desktop"`, the apps by
@@ -43,11 +47,15 @@ struct Stage {
   /// The apps those are, as the take records them. Never a window's title.
   let apps: [(name: String, id: String)]
   let names: [pid_t: String]
+  /// Each process's bundle id, for a command that names its app by one.
+  let ids: [pid_t: String]
   let desk: Set<String>
   let displayID: CGDirectDisplayID
   /// The part of the display the take is of, in global points with a top-left origin.
   let rect: CGRect
   let ground: CGColor
+  /// Nothing behind the windows: the take carries their shape as a matte (see Float.swift).
+  let floats: Bool
 }
 
 /// Which part of the desk a window at this level is, if it is one. The levels are the
@@ -100,8 +108,10 @@ func requestedStage(_ req: [String: Any], _ content: SCShareableContent, appeara
 
   var apps: [(name: String, id: String)] = []
   var names: [pid_t: String] = [:]
+  var ids: [pid_t: String] = [:]
   for app in content.applications where pids.contains(app.processID) {
     names[app.processID] = app.applicationName
+    ids[app.processID] = app.bundleIdentifier
     if !apps.contains(where: { $0.name == app.applicationName && $0.id == app.bundleIdentifier }) {
       apps.append((app.applicationName, app.bundleIdentifier))
     }
@@ -143,11 +153,14 @@ func requestedStage(_ req: [String: Any], _ content: SCShareableContent, appeara
         x: rect.minX, y: bar.frame.maxY, width: rect.width, height: rect.maxY - bar.frame.maxY)
     }
   }
-  guard let ground = parseGround(req["ground"], appearance: appearance) else {
+  let floats = req["float"] as? Bool ?? false
+  guard let painted = parseGround(req["ground"], appearance: appearance) else {
     fail("bad-request", "ground is a colour like \"#1e1e1e\".")
   }
+  let ground = floats ? CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0) : painted
   return Stage(
-    pids: pids, apps: apps, names: names, desk: desk, displayID: display.displayID, rect: rect, ground: ground)
+    pids: pids, apps: apps, names: names, ids: ids, desk: desk, displayID: display.displayID, rect: rect,
+    ground: ground, floats: floats)
 }
 
 /// The stage a request names, waited for as a window is.
@@ -250,6 +263,31 @@ extension Recorder {
     // What is on the display now and cannot be excluded is known from the start, so a take
     // does not open by waiting on it.
     ignored = (windowsOver() ?? []).subtracting(excluded)
+    // A kept menu bar will show the system's mark of this capture. What is in the bar now is
+    // noted, so what the capture adds can be told from it and covered.
+    if stage.desk.contains("menubar") {
+      if AXIsProcessTrusted() {
+        wantsMark = true
+        barBefore = systemBarItems()
+        if masks == nil {
+          let cover = Masks(pid: 0, windowID: 0, specs: [], stage: stage)
+          cover.begin()
+          masks = cover
+        }
+      } else {
+        emit([
+          "event": "notice", "code": "mark-uncovered",
+          "message":
+            "The menu bar is kept, and the mark the system adds to it while a screen is recorded will be in the picture: finding it to cover it needs Accessibility, which is not granted.",
+        ])
+      }
+    }
+    // A floating stage writes its frames itself, the matte under the picture.
+    if stage.floats, masks == nil {
+      let cover = Masks(pid: 0, windowID: 0, specs: [], stage: stage)
+      cover.begin()
+      masks = cover
+    }
     // Always said: a filter left to choose its own rectangle does not always choose the display's.
     appliedRect = CGRect(
       x: stage.rect.minX - display.frame.minX, y: stage.rect.minY - display.frame.minY, width: stage.rect.width,
@@ -273,6 +311,7 @@ extension Recorder {
   func watchStage() {
     guard !finished, let stage, let list = serverWindows() else { return }
     let now = CACurrentMediaTime()
+    if wantsMark { trackMark(stage, now) }
     let mine = stage.windows(in: list)
     let entry: [[String: Any]] = mine.map { w in
       var e: [String: Any] = [
@@ -332,7 +371,8 @@ extension Recorder {
       if down {
         if on {
           pressOnStage = true
-          push("down", t, pos, rect: wantFrames ? elementRect(at: pos) : nil, origin: origin)
+          // A script's press carries the bounds of what it named; a hand's, what a hit test finds.
+          push("down", t, pos, rect: takePressRect() ?? (wantFrames ? elementRect(at: pos) : nil), origin: origin)
         }
       } else if pressOnStage {
         // A press that began on the stage ends in the track wherever it is let go.
@@ -360,7 +400,9 @@ extension Recorder {
       lastKeyPing = t
       // The window the typing is in: the frontmost of the app the keyboard goes to.
       let win = stage.windows(in: order).first(where: { $0.pid == front })?.bounds ?? stage.rect
-      if wantFrames, let r = focusedRect(), stage.rect.intersects(r) {
+      // What is seen of the element: a terminal's text reaches far above its window, and the
+      // middle of all of it is nowhere on screen.
+      if wantFrames, let whole = focusedRect(), case let r = whole.intersection(win), !r.isEmpty {
         let fills = r.width * r.height > 0.5 * win.width * win.height
         if fills, let c = caretRect(), stage.rect.intersects(c) {
           push("key", t, CGPoint(x: c.midX, y: c.midY), origin: origin)
@@ -379,5 +421,245 @@ extension Recorder {
     return Set(
       list.filter { $0.alpha > 0 && $0.bounds.intersects(stage.rect) && !stage.holds(pid: $0.pid, layer: $0.layer) }
         .map { $0.id })
+  }
+}
+
+// MARK: the system's mark in a kept menu bar
+
+/// How long after the capture begins the mark is looked for: it appears with the capture.
+let MARK_SEARCH_SECONDS = 3.0
+/// How long frames wait for it. Past this the take goes on and says the mark may be in it.
+let MARK_HOLD_SECONDS = 1.5
+/// Points covered each side of the mark's own item: it is drawn wider than the item says.
+let MARK_PAD: CGFloat = 14
+
+/// The processes that have owned the system's menu bar items, across the macOS versions run.
+let BAR_AGENTS = ["com.apple.MenuBarAgent", "com.apple.controlcenter", "com.apple.systemuiserver"]
+
+/// What the system calls the item it shows while a screen, a camera or a microphone is in use.
+let MARK_IDENTIFIERS: Set<String> = ["com.apple.menuextra.audiovideo"]
+
+/// A bar item's identifier: its own, or that of the menu extra it hosts.
+func barItemIdentifier(_ item: AXUIElement) -> String {
+  func id(_ el: AXUIElement) -> String {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, kAXIdentifierAttribute as CFString, &v) == .success else { return "" }
+    return v as? String ?? ""
+  }
+  let own = id(item)
+  if !own.isEmpty { return own }
+  var kids: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(item, kAXChildrenAttribute as CFString, &kids) == .success,
+    let first = (kids as? [AXUIElement])?.first
+  else { return "" }
+  return id(first)
+}
+
+/// The system's own status items in the menu bar, as accessibility has them.
+func systemBarItems() -> [AXUIElement] {
+  var out: [AXUIElement] = []
+  for app in NSWorkspace.shared.runningApplications where BAR_AGENTS.contains(app.bundleIdentifier ?? "") {
+    let el = AXUIElementCreateApplication(app.processIdentifier)
+    AXUIElementSetMessagingTimeout(el, 0.3)
+    var bar: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, "AXExtrasMenuBar" as CFString, &bar) == .success, let bar else { continue }
+    var kids: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(bar as! AXUIElement, kAXChildrenAttribute as CFString, &kids) == .success,
+      let items = kids as? [AXUIElement]
+    else { continue }
+    out.append(contentsOf: items)
+  }
+  return out
+}
+
+extension Recorder {
+  /// Finds the item the system added to the bar when this capture began, and keeps it
+  /// covered where it is: other items appearing move it.
+  func trackMark(_ stage: Stage, _ now: Double) {
+    if markStart == 0 { markStart = now }
+    if markItems.isEmpty, now - markStart < MARK_SEARCH_SECONDS, now >= nextMarkSearch {
+      nextMarkSearch = now + 0.15
+      let items = systemBarItems()
+      // By what the system calls it; and where a macOS calls it something else, by its
+      // having come into the bar after the capture began.
+      let named = items.filter { MARK_IDENTIFIERS.contains(barItemIdentifier($0)) }
+      let before = barBefore
+      markItems = named.isEmpty ? items.filter { item in !before.contains { CFEqual($0, item) } } : named
+    }
+    let settled = locked(evLock) { markSettled }
+    if !markItems.isEmpty {
+      let rects = markItems.compactMap(axRect).map { r in
+        r.insetBy(dx: -MARK_PAD, dy: 0).offsetBy(dx: -stage.rect.minX, dy: -stage.rect.minY)
+      }
+      masks?.cover(also: rects)
+      if !settled { settleMark(found: true) }
+    } else if !settled, now - markStart >= MARK_HOLD_SECONDS {
+      settleMark(found: false)
+    }
+  }
+
+  /// Lets frames through, and asks the capture for one: a stage that is still would
+  /// otherwise send none to begin the take with.
+  func settleMark(found: Bool) {
+    locked(evLock) { markSettled = true }
+    if !found {
+      emit([
+        "event": "notice", "code": "mark-uncovered",
+        "message":
+          "The mark the system adds to the menu bar while a screen is recorded was not found to cover. If it shows, it is in the picture.",
+      ])
+    }
+    nudge()
+  }
+
+  /// Asks the capture for a frame now. Frames come only when pixels change, so after frames
+  /// were held back a picture that is still would send no other, and a take that has not
+  /// begun would never begin. On `watchQ`.
+  func nudge() {
+    guard !finished, let s = stream else { return }
+    let config = self.config
+    Task {
+      _ = try? await limited("Asking the capture for a frame", seconds: 3) {
+        try await s.updateConfiguration(config)
+        return Handed(value: ())
+      }
+    }
+  }
+}
+
+// MARK: a scripted stage
+
+extension Stage {
+  /// The process a command or a mask names: by `pid`, or by `app` (a name or a bundle id).
+  /// Nil when it names none. A name several instances share is the first of them: a process
+  /// id tells them apart.
+  func process(named item: [String: Any]) throws -> pid_t? {
+    if let given = item["pid"] as? Int {
+      guard pids.contains(pid_t(given)) else {
+        throw InputError(code: "bad-request", message: "The process \(given) is not on the stage.")
+      }
+      return pid_t(given)
+    }
+    guard let app = item["app"] as? String else { return nil }
+    let matches = pids.filter { names[$0] == app || ids[$0] == app }.sorted()
+    guard let first = matches.first else {
+      throw InputError(code: "bad-request", message: "\"\(app)\" is not on the stage. On it: \(apps.map { $0.name }.joined(separator: ", ")).")
+    }
+    return first
+  }
+}
+
+/// The commands of a scripted stage. Each says which app it acts on (`app` or `pid`); one
+/// that says none acts on the app the last one named. The app is brought forward as a hand
+/// would bring it, and every answer's bounds are in the stage's points, the space the track
+/// is in. A point given as `x`, `y` is in the named app's own window, as its outline has it.
+///
+/// A drag may end in another app: `"to": { "app": "…", "selector": "…" }`.
+final class StageDriver: @unchecked Sendable {
+  let rec: Recorder
+  let stage: Stage
+  private var drivers: [pid_t: Driver] = [:]
+  private var current: pid_t?
+
+  init(rec: Recorder, stage: Stage) {
+    self.rec = rec
+    self.stage = stage
+  }
+
+  private func driver(_ pid: pid_t) -> Driver {
+    if let d = drivers[pid] { return d }
+    let d = Driver(rec: rec, pid: pid, windowID: 0, stage: stage)
+    drivers[pid] = d
+    return d
+  }
+
+  func run(_ cmd: [String: Any]) -> [String: Any] {
+    var failure: [String: Any] = ["event": "result", "ok": false]
+    if let id = cmd["id"] { failure["id"] = id }
+    do {
+      let named = try stage.process(named: cmd)
+      guard let pid = named ?? current ?? (stage.pids.count == 1 ? stage.pids.first : nil) else {
+        // The take's clock needs no app.
+        if cmd["do"] as? String == "now", let any = stage.pids.min() { return driver(any).run(cmd) }
+        throw InputError(
+          code: "bad-request",
+          message: "A command on a stage of several apps says which it acts on: \"app\" (a name or bundle id) or \"pid\".")
+      }
+      current = pid
+      var cmd = cmd
+      // A drag that ends in another app: its far end is found there, and handed over as a point.
+      if cmd["do"] as? String == "drag", let to = cmd["to"] as? [String: Any],
+        let other = try stage.process(named: to), other != pid
+      {
+        guard let end = try driver(other).target(to) else {
+          throw InputError(
+            code: "not-found", message: "Nothing in the window matches \(to["selector"] as? String ?? "the drag's end").")
+        }
+        cmd["to"] = ["gx": end.point.x, "gy": end.point.y]
+      }
+      return driver(pid).run(cmd)
+    } catch let e as InputError {
+      failure["code"] = e.code
+      failure["message"] = e.message
+    } catch {
+      failure["code"] = "failed"
+      failure["message"] = error.localizedDescription
+    }
+    return failure
+  }
+}
+
+/// `still` for a stage: one picture of it, as a take would show it.
+func cmdStageStill(_ req: [String: Any], out: String) async {
+  let (content, found) = await awaitedStage(req, appearance: systemAppearance())
+  guard let stage = found, let display = content.displays.first(where: { $0.displayID == stage.displayID }) else {
+    fail("no-window", "None of the apps the stage names has a window on screen.")
+  }
+  do {
+    let filter = SCContentFilter(display: display, excludingWindows: stage.others(content))
+    let scale = Double(filter.pointPixelScale)
+    let config = SCStreamConfiguration()
+    config.sourceRect = CGRect(
+      x: stage.rect.minX - display.frame.minX, y: stage.rect.minY - display.frame.minY, width: stage.rect.width,
+      height: stage.rect.height)
+    var w = Int((stage.rect.width * scale).rounded())
+    var h = Int((stage.rect.height * scale).rounded())
+    if w > 3840 {
+      h = Int(Double(h) * 3840.0 / Double(w))
+      w = 3840
+    }
+    config.width = w
+    config.height = h
+    config.showsCursor = false
+    config.backgroundColor = stage.ground
+    let image = try await limited("The picture of the stage") {
+      Handed(value: try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config))
+    }
+    guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+      fail("write-failed", "The picture could not be made into a PNG.")
+    }
+    let url = URL(fileURLWithPath: out)
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try png.write(to: url)
+    let list = serverWindows() ?? []
+    emit([
+      "event": "still", "out": url.path, "app": "", "window": 0,
+      "width": image.width, "height": image.height, "scale": Double(image.width) / stage.rect.width,
+      "frame": ["x": stage.rect.minX, "y": stage.rect.minY, "w": stage.rect.width, "h": stage.rect.height],
+      "apps": stage.apps.map { ["name": $0.name, "id": $0.id] },
+      // Where each app's windows are on the stage, front to back, so an outline of one
+      // (which is in that window's own points) can be placed on the picture.
+      "windows": stage.windows(in: list).map { w in
+        [
+          "id": Int(w.id), "app": stage.names[w.pid] ?? "", "pid": Int(w.pid),
+          "x": r1(w.bounds.minX - stage.rect.minX), "y": r1(w.bounds.minY - stage.rect.minY),
+          "w": r1(w.bounds.width), "h": r1(w.bounds.height),
+        ] as [String: Any]
+      },
+    ])
+  } catch let late as TimedOut {
+    fail("start-failed", late.localizedDescription)
+  } catch {
+    fail("write-failed", "The picture could not be taken: \(error.localizedDescription)")
   }
 }

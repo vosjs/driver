@@ -68,6 +68,10 @@ let BEGIN_SECONDS = 20.0
 /// not going to be.
 let STRANGER_SECONDS = 2.0
 
+/// How long after a renewed exclusion list is accepted a frame may still arrive that was
+/// composed under the old one. Measured: one frame, so a few frame intervals are waited.
+let RENEWAL_SETTLE_SECONDS = 0.1
+
 /// No window's corners are rounder than this. A corner that reads rounder is a window that
 /// is black where it meets the black outside it, and says nothing about its shape.
 let CORNER_CEILING_POINTS = 40.0
@@ -259,6 +263,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   /// What the take keeps out of its pixels (Mask.swift). With masks, every frame is copied,
   /// covered and handed to the writer through `adaptor`; without, frames go as they came.
   var masks: Masks?
+  /// Where a floating stage's matte stands in its file. Nil for every other take.
+  var matte: Matte?
   var adaptor: AVAssetWriterInputPixelBufferAdaptor?
 
   // The capture follows the window and keeps every other application out, for the whole
@@ -359,6 +365,17 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
   /// True from a press that began on the stage until it is let go.
   var pressOnStage = false
 
+  // The system's own mark in a kept menu bar (Stage.swift): found once the capture has begun,
+  // and covered before a frame is encoded. On `watchQ`, but `markSettled`, behind `evLock`.
+  var wantsMark = false
+  var barBefore: [AXUIElement] = []
+  var markItems: [AXUIElement] = []
+  var markStart = 0.0
+  var nextMarkSearch = 0.0
+  /// True once the mark is covered, or was looked for long enough: frames go to the file.
+  var markSettled = false
+  var markHeld = 0
+
   let stopLock = NSLock()
   var finished = false
   /// What the process exits with once the take is over.
@@ -433,6 +450,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     w -= w % 2
     h -= h % 2
     pixelSize = (w, h)
+    // A floating stage's file is taller than its picture: the matte stands under it.
+    if stage?.floats ?? false { matte = Matte.layout(width: w, height: h, fps: fps) }
+    let fileH = h + (matte?.strip ?? 0)
 
     config.width = w
     config.height = h
@@ -457,7 +477,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       outputSettings: [
         AVVideoCodecKey: AVVideoCodecType.h264,
         AVVideoWidthKey: w,
-        AVVideoHeightKey: h,
+        AVVideoHeightKey: fileH,
         AVVideoCompressionPropertiesKey: [
           AVVideoAverageBitRateKey: bitrate,
           AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
@@ -473,7 +493,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         sourcePixelBufferAttributes: [
           kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
           kCVPixelBufferWidthKey as String: w,
-          kCVPixelBufferHeightKey as String: h,
+          kCVPixelBufferHeightKey as String: fileH,
         ])
     }
     writer.add(input)
@@ -496,6 +516,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       "accessibility": AXIsProcessTrusted(), "appearance": appearance,
     ]
     if let masks { readyEvent["masks"] = masks.matched }
+    if let matte { readyEvent["matte"] = matte.json }
     if let stage {
       readyEvent["apps"] = stage.apps.map { ["name": $0.name, "id": $0.id] }
       readyEvent["desk"] = DESK_PARTS.filter { stage.desk.contains($0) }
@@ -540,6 +561,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     let now = CACurrentMediaTime()
     // Another application's window over this one is not in the take, not for one frame: a
     // frame that may show one is held back, and the picture keeps its last clean frame.
+    // A kept menu bar shows the system's own mark of this very capture: no frame is kept
+    // until it is found and covered (or was looked for long enough to say it is not there).
+    if wantsMark, !locked(evLock, { markSettled }) {
+      markHeld += 1
+      return
+    }
     if excludesOthers {
       if let strangers = strangersOver() {
         held += 1
@@ -576,7 +603,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     if let masks {
       // A frame that cannot be covered is not written: the picture keeps its last frame.
       if let adaptor, let pool = adaptor.pixelBufferPool, let pixels = CMSampleBufferGetImageBuffer(sb),
-        let covered = masks.covering(pixels, pool: pool, window: pointSize)
+        let covered = masks.covering(pixels, pool: pool, window: pointSize),
+        matte?.pack(pixels, into: covered) ?? true
       {
         written = adaptor.append(covered, withPresentationTime: at)
       }
@@ -816,8 +844,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         let beyond: Set<CGWindowID> = locked(self.exLock) {
           if let applied {
             self.excluded = applied
-            // Frames taken before now were taken under the old list.
-            self.cleanFrom = since
+            // Frames taken before now were taken under the old list, and so is one already on
+            // its way when the new list was accepted: it arrives after this, still showing
+            // what was just excluded. Frames wait a moment longer than the call.
+            self.cleanFrom = since + RENEWAL_SETTLE_SECONDS
+            self.watchQ.asyncAfter(deadline: .now() + RENEWAL_SETTLE_SECONDS + 0.03) { self.nudge() }
           }
           var given = Set<CGWindowID>()
           for (id, firstSeen) in asked {
@@ -904,7 +935,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       lastKeyCount = keys
       if t - lastKeyPing >= 350, NSWorkspace.shared.frontmostApplication?.localizedName == appName {
         lastKeyPing = t
-        if wantFrames, let r = focusedRect(), win.intersects(r) {
+        // What is seen of the element: a terminal's text reaches far above its window, and
+        // the middle of all of it is nowhere on screen.
+        if wantFrames, let whole = focusedRect(), case let r = whole.intersection(win), !r.isEmpty {
           // A field names itself. An element that fills the window (an editor, a canvas) says
           // nothing about WHERE the typing is: there the ping sits at the insertion point.
           let fills = r.width * r.height > 0.5 * win.width * win.height
@@ -1001,6 +1034,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       meta["app"] = nil
       meta["apps"] = stage.apps.map { ["name": $0.name, "id": $0.id] }
       meta["desk"] = DESK_PARTS.filter { stage.desk.contains($0) }
+      if let matte { meta["matte"] = matte.json }
       meta["windows"] = stageWindowsJSON(durationMs: durationMs)
     }
     if resized { meta["resizedDuringTake"] = true }
@@ -1123,12 +1157,15 @@ func cmdRecord(_ json: String) async {
       ("window", "A stage is every window of the apps it names: it takes no one window."),
       ("size", "A stage does not size a window: its windows are recorded where and as they are."),
       ("filter", "A stage has one scope: the display with everything that was not named kept out."),
-      ("drive", "A stage takes no script yet: it is performed."),
-      ("mask", "A stage takes no mask yet: stage what must not be seen, or leave its app off the stage."),
     ]
+    if req["float"] as? Bool ?? false {
+      // Floating is the windows and nothing else: there is no ground to colour and no desk under them.
+      if req["ground"] is String { fail("bad-request", "A floating stage has no ground: float and ground are not given together.") }
+      if !((req["desk"] as? [String]) ?? []).isEmpty {
+        fail("bad-request", "A floating stage keeps no part of the desk: float and desk are not given together.")
+      }
+    }
     for (field, why) in refused where req[field] != nil && !(req[field] is NSNull) {
-      if field == "drive", req[field] as? Bool == false { continue }
-      if field == "mask", (req[field] as? [Any])?.isEmpty == true { continue }
       fail("bad-request", why)
     }
     for part in (req["desk"] as? [String]) ?? [] where !DESK_PARTS.contains(part) {
@@ -1137,7 +1174,17 @@ func cmdRecord(_ json: String) async {
   }
 
   let maskSpecs: [Masks.Spec]
-  do { maskSpecs = try Masks.parse(req["mask"]) } catch { fail("bad-request", error.localizedDescription) }
+  if staged {
+    // A stage's masks name their apps, so they are read once the stage is known.
+    maskSpecs = []
+    if let list = req["mask"] as? [[String: Any]], list.contains(where: { $0["selector"] != nil }),
+      !AXIsProcessTrusted()
+    {
+      fail("accessibility", ACCESSIBILITY_NEEDED)
+    }
+  } else {
+    do { maskSpecs = try Masks.parse(req["mask"]) } catch { fail("bad-request", error.localizedDescription) }
+  }
   // An element is found through the app's accessibility tree: said before anything is recorded.
   if maskSpecs.contains(where: { $0.selector != nil }), !AXIsProcessTrusted() {
     fail("accessibility", ACCESSIBILITY_NEEDED)
@@ -1169,12 +1216,34 @@ func cmdRecord(_ json: String) async {
     guard let stage = found else {
       fail("no-window", "None of the apps the stage names has a window on screen.")
     }
+    let stageMasks: [Masks.Spec]
+    do { stageMasks = try Masks.parse(req["mask"], stage: stage) } catch {
+      fail("bad-request", error.localizedDescription)
+    }
+    if !stageMasks.isEmpty {
+      progress.at("finding what the take covers")
+      let masks = Masks(pid: 0, windowID: 0, specs: stageMasks, stage: stage)
+      masks.begin()
+      for (i, n) in masks.matched.enumerated() where n == 0 {
+        emit([
+          "event": "notice", "code": "mask-unmatched",
+          "message":
+            "The mask \(stageMasks[i].selector ?? "") matches nothing on the stage now. It is covered from the moment it appears, which can be a frame or two late.",
+        ])
+      }
+      rec.masks = masks
+    }
     do {
       try await rec.startStage(content: content, stage: stage)
     } catch {
       fail("start-failed", error.localizedDescription)
     }
-    await finish(rec: rec, driver: nil, maxSeconds: maxSeconds)
+    // A scripted stage: each command says which app it acts on, and that app is brought
+    // forward when the command comes, as a hand would bring it.
+    let script = drives ? StageDriver(rec: rec, stage: stage) : nil
+    await finish(
+      rec: rec, run: script.map { s in { s.run($0) } },
+      idle: "A performed stage takes no commands. Record it with drive to script it.", maxSeconds: maxSeconds)
   }
 
   progress.at("listing the screen's windows")
@@ -1235,12 +1304,16 @@ func cmdRecord(_ json: String) async {
     fail("start-failed", error.localizedDescription)
   }
 
-  await finish(rec: rec, driver: Driver(rec: rec, pid: pid, windowID: w.windowID), maxSeconds: maxSeconds)
+  let driver = Driver(rec: rec, pid: pid, windowID: w.windowID)
+  await finish(rec: rec, run: { driver.run($0) }, idle: "", maxSeconds: maxSeconds)
 }
 
 /// A take that has started, to its end: it ends on `stop`, a signal, the cap, or the process
-/// that started it going away, and the helper exits with what the take came to.
-func finish(rec: Recorder, driver: Driver?, maxSeconds: Double) async -> Never {
+/// that started it going away, and the helper exits with what the take came to. `run` answers
+/// a script's commands; a take with none says `idle` to one.
+func finish(
+  rec: Recorder, run: (@Sendable ([String: Any]) -> [String: Any])?, idle: String, maxSeconds: Double
+) async -> Never {
   DispatchQueue.global().asyncAfter(deadline: .now() + maxSeconds) { Task { await rec.stop(reason: "cap") } }
 
   let parentHoldsStdin = stdinIsPipe()
@@ -1259,11 +1332,13 @@ func finish(rec: Recorder, driver: Driver?, maxSeconds: Double) async -> Never {
         emit(["event": "result", "ok": false, "code": "bad-request", "message": "A line on stdin is `stop` or one JSON command."])
         continue
       }
-      guard let driver else {
-        emit(["event": "result", "ok": false, "code": "bad-request", "message": "A stage takes no commands yet: it is performed."])
+      guard let run else {
+        var refused: [String: Any] = ["event": "result", "ok": false, "code": "bad-request", "message": idle]
+        if let id = cmd["id"] { refused["id"] = id }
+        emit(refused)
         continue
       }
-      emit(driver.run(cmd))
+      emit(run(cmd))
     }
     // End of input. On a pipe, whatever started this is gone, and a recorder never outlives it.
     if parentHoldsStdin { Task { await rec.stop(reason: "parent-gone") } }
@@ -1398,6 +1473,11 @@ func cmdStill(_ json: String) async {
   else { fail("bad-request", "The still request is not a JSON object.") }
   guard let out = req["out"] as? String, !out.isEmpty else {
     fail("bad-request", "The request names no out file.")
+  }
+  if isStageRequest(req) {
+    answerWithin(BEGIN_SECONDS, "The picture of the stage")
+    await cmdStageStill(req, out: out)
+    return
   }
   answerWithin(BEGIN_SECONDS, "The picture of the window")
   let (content, found) = await awaitedWindow(req)

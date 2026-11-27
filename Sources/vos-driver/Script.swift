@@ -35,26 +35,48 @@ final class Driver: @unchecked Sendable {
   let rec: Recorder
   let pid: pid_t
   let windowID: CGWindowID
+  /// On a stage (Stage.swift) the app's main window is found anew for every command, since an
+  /// app there may open another, and answers are in the stage's points.
+  let stage: Stage?
 
-  init(rec: Recorder, pid: pid_t, windowID: CGWindowID) {
+  init(rec: Recorder, pid: pid_t, windowID: CGWindowID, stage: Stage? = nil) {
     self.rec = rec
     self.pid = pid
     self.windowID = windowID
+    self.stage = stage
   }
 
   /// Milliseconds on the take's clock, now.
   var now: Double { ((CACurrentMediaTime() - (rec.t0Host ?? CACurrentMediaTime())) * 1000) }
 
   func frame() throws -> CGRect {
+    if stage != nil {
+      guard let w = appWindow(["pid": Int(pid)]) else {
+        throw InputError(code: "no-window", message: "The app has no window on the stage.")
+      }
+      return w.frame
+    }
     guard let f = windowFrame(windowID) else {
       throw InputError(code: "no-window", message: "The window being recorded is gone.")
     }
     return f
   }
 
+  /// The space answers are given in, which is the track's: the window, or the stage.
+  func space() throws -> CGRect {
+    if let stage { return stage.rect }
+    return try frame()
+  }
+
   /// The window's tree, read now: an interface changes under a script, so it is never kept.
   func tree() throws -> (root: Node, window: CGRect, element: AXUIElement) {
     guard AXIsProcessTrusted() else { throw InputError(code: "accessibility", message: ACCESSIBILITY_NEEDED) }
+    if stage != nil {
+      guard let found = appWindow(["pid": Int(pid)]), let root = readTree(found.window) else {
+        throw InputError(code: "no-tree", message: "The app's window offers no accessibility tree to find elements in.")
+      }
+      return (root, found.frame, found.window)
+    }
     let f = try frame()
     guard let w = windowElement(pid, frame: f), let root = readTree(w) else {
       throw InputError(code: "no-tree", message: "The window offers no accessibility tree to find elements in.")
@@ -88,9 +110,14 @@ final class Driver: @unchecked Sendable {
         throw InputError(code: "not-in-view", message: "\(selector) is outside the window's visible area.")
       }
       let visible = first.frame.intersection(window)
+      // The rectangle said of it is what is seen of it: the part inside the window.
       return Target(
-        point: CGPoint(x: visible.midX, y: visible.midY), rect: first.frame, count: found.count,
+        point: CGPoint(x: visible.midX, y: visible.midY), rect: visible, count: found.count,
         enabled: first.enabled, name: first.name)
+    }
+    // A point already found elsewhere (a stage's drag that ends in another app), in global points.
+    if let gx = (cmd["gx"] as? NSNumber)?.doubleValue, let gy = (cmd["gy"] as? NSNumber)?.doubleValue {
+      return Target(point: CGPoint(x: gx, y: gy), rect: nil, count: 1, enabled: true)
     }
     if let x = (cmd["x"] as? NSNumber)?.doubleValue, let y = (cmd["y"] as? NSNumber)?.doubleValue {
       let f = try frame()
@@ -152,7 +179,7 @@ final class Driver: @unchecked Sendable {
           var focused: [String: Any] = ["role": role]
           let name = nameOf(el, role: role)
           if !name.isEmpty { focused["name"] = name }
-          if let r = axRect(el) { focused["rect"] = rectJSON(r, try frame()) }
+          if let r = axRect(el) { focused["rect"] = rectJSON(r, try space()) }
           answer["focused"] = focused
         }
         answer["frontmost"] = frontmostPid() == pid
@@ -161,7 +188,7 @@ final class Driver: @unchecked Sendable {
           answer["count"] = t.count
           answer["enabled"] = t.enabled
           if !t.name.isEmpty { answer["name"] = t.name }
-          if let r = t.rect { answer["rect"] = rectJSON(r, try frame()) }
+          if let r = t.rect { answer["rect"] = rectJSON(r, try space()) }
         } else {
           answer["count"] = 0
         }
@@ -171,7 +198,7 @@ final class Driver: @unchecked Sendable {
         glide(to: t.point)
         answer["count"] = t.count
         answer["enabled"] = t.enabled
-        if let r = t.rect { answer["rect"] = rectJSON(r, try frame()) }
+        if let r = t.rect { answer["rect"] = rectJSON(r, try space()) }
         if verb == "click" {
           // A disabled control is found and not pressed: the script hears it, and decides.
           if t.enabled {
@@ -202,7 +229,7 @@ final class Driver: @unchecked Sendable {
           press(at: t.point)
           usleep(150_000)
           answer["count"] = t.count
-          if let r = t.rect { answer["rect"] = rectJSON(r, try frame()) }
+          if let r = t.rect { answer["rect"] = rectJSON(r, try space()) }
         }
         let app = pid
         guard typeText(text, delayMs: (cmd["delayMs"] as? NSNumber)?.doubleValue ?? 70, stillThere: { frontmostPid() == app })
@@ -232,8 +259,8 @@ final class Driver: @unchecked Sendable {
         if cmd["selector"] != nil || cmd["x"] != nil {
           guard let t = try target(cmd) else { throw notFound(cmd) }
           glide(to: t.point)
-          if let r = t.rect { answer["rect"] = rectJSON(r, try frame()) }
-        } else if let f = windowFrame(windowID), !f.contains(pointerLocation()) {
+          if let r = t.rect { answer["rect"] = rectJSON(r, try space()) }
+        } else if let f = try? frame(), !f.contains(pointerLocation()) {
           // The wheel turns what is under the pointer: over the window, or nothing happens.
           glide(to: CGPoint(x: f.midX, y: f.midY))
         }
@@ -257,7 +284,7 @@ final class Driver: @unchecked Sendable {
         usleep(80_000)
         postMouse(.leftMouseUp, end.point, flags: held)
         releaseModifiers(held)
-        if let r = from.rect { answer["rect"] = rectJSON(r, try frame()) }
+        if let r = from.rect { answer["rect"] = rectJSON(r, try space()) }
       case "move":
         guard let t = try target(cmd) else { throw notFound(cmd) }
         glide(to: t.point, ms: (cmd["ms"] as? NSNumber)?.doubleValue)
