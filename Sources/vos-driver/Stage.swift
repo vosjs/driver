@@ -13,8 +13,12 @@
 //     "desk": ["menubar", "dock", "wallpaper"],        parts of the desk to keep; default none
 //     "display": 1,                                    a display id; default the one that holds
 //                                                      most of the named apps' windows
-//     "ground": "#1e1e1e" }                            what is painted where nothing is; default
+//     "ground": "#1e1e1e",                             what is painted where nothing is; default
 //                                                      a neutral of the system's appearance
+//     "drive": true,                                   scripted: commands on stdin, each naming
+//                                                      its app (StageDriver, below)
+//     "mask": [{"app": "Linear", "selector": "…"}] }   covered before a frame is encoded; an
+//                                                      element's mask names its app
 //
 // The frame is the display, less the menu bar's strip when the bar is not kept. The pointer's
 // track is in that frame's points. `meta.json` says `captureSurface: "desktop"`, the apps by
@@ -43,6 +47,8 @@ struct Stage {
   /// The apps those are, as the take records them. Never a window's title.
   let apps: [(name: String, id: String)]
   let names: [pid_t: String]
+  /// Each process's bundle id, for a command that names its app by one.
+  let ids: [pid_t: String]
   let desk: Set<String>
   let displayID: CGDirectDisplayID
   /// The part of the display the take is of, in global points with a top-left origin.
@@ -100,8 +106,10 @@ func requestedStage(_ req: [String: Any], _ content: SCShareableContent, appeara
 
   var apps: [(name: String, id: String)] = []
   var names: [pid_t: String] = [:]
+  var ids: [pid_t: String] = [:]
   for app in content.applications where pids.contains(app.processID) {
     names[app.processID] = app.applicationName
+    ids[app.processID] = app.bundleIdentifier
     if !apps.contains(where: { $0.name == app.applicationName && $0.id == app.bundleIdentifier }) {
       apps.append((app.applicationName, app.bundleIdentifier))
     }
@@ -147,7 +155,8 @@ func requestedStage(_ req: [String: Any], _ content: SCShareableContent, appeara
     fail("bad-request", "ground is a colour like \"#1e1e1e\".")
   }
   return Stage(
-    pids: pids, apps: apps, names: names, desk: desk, displayID: display.displayID, rect: rect, ground: ground)
+    pids: pids, apps: apps, names: names, ids: ids, desk: desk, displayID: display.displayID, rect: rect,
+    ground: ground)
 }
 
 /// The stage a request names, waited for as a window is.
@@ -332,7 +341,8 @@ extension Recorder {
       if down {
         if on {
           pressOnStage = true
-          push("down", t, pos, rect: wantFrames ? elementRect(at: pos) : nil, origin: origin)
+          // A script's press carries the bounds of what it named; a hand's, what a hit test finds.
+          push("down", t, pos, rect: takePressRect() ?? (wantFrames ? elementRect(at: pos) : nil), origin: origin)
         }
       } else if pressOnStage {
         // A press that began on the stage ends in the track wherever it is let go.
@@ -379,5 +389,142 @@ extension Recorder {
     return Set(
       list.filter { $0.alpha > 0 && $0.bounds.intersects(stage.rect) && !stage.holds(pid: $0.pid, layer: $0.layer) }
         .map { $0.id })
+  }
+}
+
+// MARK: a scripted stage
+
+extension Stage {
+  /// The process a command or a mask names: by `pid`, or by `app` (a name or a bundle id).
+  /// Nil when it names none. A name several instances share is the first of them: a process
+  /// id tells them apart.
+  func process(named item: [String: Any]) throws -> pid_t? {
+    if let given = item["pid"] as? Int {
+      guard pids.contains(pid_t(given)) else {
+        throw InputError(code: "bad-request", message: "The process \(given) is not on the stage.")
+      }
+      return pid_t(given)
+    }
+    guard let app = item["app"] as? String else { return nil }
+    let matches = pids.filter { names[$0] == app || ids[$0] == app }.sorted()
+    guard let first = matches.first else {
+      throw InputError(code: "bad-request", message: "\"\(app)\" is not on the stage. On it: \(apps.map { $0.name }.joined(separator: ", ")).")
+    }
+    return first
+  }
+}
+
+/// The commands of a scripted stage. Each says which app it acts on (`app` or `pid`); one
+/// that says none acts on the app the last one named. The app is brought forward as a hand
+/// would bring it, and every answer's bounds are in the stage's points, the space the track
+/// is in. A point given as `x`, `y` is in the named app's own window, as its outline has it.
+///
+/// A drag may end in another app: `"to": { "app": "…", "selector": "…" }`.
+final class StageDriver: @unchecked Sendable {
+  let rec: Recorder
+  let stage: Stage
+  private var drivers: [pid_t: Driver] = [:]
+  private var current: pid_t?
+
+  init(rec: Recorder, stage: Stage) {
+    self.rec = rec
+    self.stage = stage
+  }
+
+  private func driver(_ pid: pid_t) -> Driver {
+    if let d = drivers[pid] { return d }
+    let d = Driver(rec: rec, pid: pid, windowID: 0, stage: stage)
+    drivers[pid] = d
+    return d
+  }
+
+  func run(_ cmd: [String: Any]) -> [String: Any] {
+    var failure: [String: Any] = ["event": "result", "ok": false]
+    if let id = cmd["id"] { failure["id"] = id }
+    do {
+      let named = try stage.process(named: cmd)
+      guard let pid = named ?? current ?? (stage.pids.count == 1 ? stage.pids.first : nil) else {
+        // The take's clock needs no app.
+        if cmd["do"] as? String == "now", let any = stage.pids.min() { return driver(any).run(cmd) }
+        throw InputError(
+          code: "bad-request",
+          message: "A command on a stage of several apps says which it acts on: \"app\" (a name or bundle id) or \"pid\".")
+      }
+      current = pid
+      var cmd = cmd
+      // A drag that ends in another app: its far end is found there, and handed over as a point.
+      if cmd["do"] as? String == "drag", let to = cmd["to"] as? [String: Any],
+        let other = try stage.process(named: to), other != pid
+      {
+        guard let end = try driver(other).target(to) else {
+          throw InputError(
+            code: "not-found", message: "Nothing in the window matches \(to["selector"] as? String ?? "the drag's end").")
+        }
+        cmd["to"] = ["gx": end.point.x, "gy": end.point.y]
+      }
+      return driver(pid).run(cmd)
+    } catch let e as InputError {
+      failure["code"] = e.code
+      failure["message"] = e.message
+    } catch {
+      failure["code"] = "failed"
+      failure["message"] = error.localizedDescription
+    }
+    return failure
+  }
+}
+
+/// `still` for a stage: one picture of it, as a take would show it.
+func cmdStageStill(_ req: [String: Any], out: String) async {
+  let (content, found) = await awaitedStage(req, appearance: systemAppearance())
+  guard let stage = found, let display = content.displays.first(where: { $0.displayID == stage.displayID }) else {
+    fail("no-window", "None of the apps the stage names has a window on screen.")
+  }
+  do {
+    let filter = SCContentFilter(display: display, excludingWindows: stage.others(content))
+    let scale = Double(filter.pointPixelScale)
+    let config = SCStreamConfiguration()
+    config.sourceRect = CGRect(
+      x: stage.rect.minX - display.frame.minX, y: stage.rect.minY - display.frame.minY, width: stage.rect.width,
+      height: stage.rect.height)
+    var w = Int((stage.rect.width * scale).rounded())
+    var h = Int((stage.rect.height * scale).rounded())
+    if w > 3840 {
+      h = Int(Double(h) * 3840.0 / Double(w))
+      w = 3840
+    }
+    config.width = w
+    config.height = h
+    config.showsCursor = false
+    config.backgroundColor = stage.ground
+    let image = try await limited("The picture of the stage") {
+      Handed(value: try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config))
+    }
+    guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+      fail("write-failed", "The picture could not be made into a PNG.")
+    }
+    let url = URL(fileURLWithPath: out)
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try png.write(to: url)
+    let list = serverWindows() ?? []
+    emit([
+      "event": "still", "out": url.path, "app": "", "window": 0,
+      "width": image.width, "height": image.height, "scale": Double(image.width) / stage.rect.width,
+      "frame": ["x": stage.rect.minX, "y": stage.rect.minY, "w": stage.rect.width, "h": stage.rect.height],
+      "apps": stage.apps.map { ["name": $0.name, "id": $0.id] },
+      // Where each app's windows are on the stage, front to back, so an outline of one
+      // (which is in that window's own points) can be placed on the picture.
+      "windows": stage.windows(in: list).map { w in
+        [
+          "id": Int(w.id), "app": stage.names[w.pid] ?? "", "pid": Int(w.pid),
+          "x": r1(w.bounds.minX - stage.rect.minX), "y": r1(w.bounds.minY - stage.rect.minY),
+          "w": r1(w.bounds.width), "h": r1(w.bounds.height),
+        ] as [String: Any]
+      },
+    ])
+  } catch let late as TimedOut {
+    fail("start-failed", late.localizedDescription)
+  } catch {
+    fail("write-failed", "The picture could not be taken: \(error.localizedDescription)")
   }
 }

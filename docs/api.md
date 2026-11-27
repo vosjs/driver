@@ -90,7 +90,32 @@ record({
 - **The desk's parts are found by their window level**, the system's own constants, never by who owns them or what they are called: both have changed between macOS versions.
 - **`meta.json`** says `captureSurface: "desktop"`, `apps` (name and bundle id of each), `desk`, and `windows`: `{ t, windows: [{ id, app, x, y, w, h, panel? }] }`, front to back, at the first frame and every time that changed. `panel` marks a window with no title: an alert, a popover, a tip, which is its app's window's and not a place of its own. A window is never named by its title.
 
-A stage is performed. `drive`, `mask`, `size`, `window` and `filter` are refused with it, in words.
+**Scripted.** With `drive: true` a stage takes commands as a window's take does, and each says which app it acts on:
+
+```ts
+const take = record({ apps: ['Linear', 'Terminal'], out: 'take', drive: true })
+await take.ready
+await take.send({ do: 'click', app: 'Linear', selector: "button[name='New issue']" })
+await take.send({ do: 'type', text: 'Ship stages' }) // names no app: stays with Linear
+await take.send({ do: 'type', app: 'Terminal', selector: 'textarea', text: 'git status' })
+await take.send({
+  do: 'drag',
+  app: 'Finder',
+  selector: "row[name='notes.md']",
+  to: { app: 'Linear', selector: "textarea[name='Description']" }, // a drag may end in another app
+})
+```
+
+- `app` is a name or a bundle id, `pid` a process. A command that says neither acts on the app the last one named; on a stage of one app none need say.
+- The app is brought forward when its command comes, as a hand would bring it, so the stage's own order changes as the script goes.
+- Every answer's `rect` is in the stage's points, the space `cursor.json` is in. A point given as `x`, `y` is in the named app's own window, the space its `tree` is in.
+- The app's main window is found anew for each command, so a window the app opens mid-take can be acted on.
+
+**Masks.** A stage's `mask` covers before a frame is encoded, as a window's does. An element's mask says which app it is in (`{ app: 'Linear', selector: "popup[name*='Account']" }`); on a stage of one app it need not. A rectangle is in the stage's points.
+
+**A picture first.** `still({ apps, out })` takes one picture of the stage as a take would show it, and answers with `windows`: where each app's windows are on it. `tree({ app })` is each app's outline, in its own window's points.
+
+`size`, `window` and `filter` are refused with a stage, in words.
 
 A live capture of a display makes the system show its own sharing indicator in the menu bar. A stage that keeps the bar (`desk: ['menubar']`) has it in its pixels.
 

@@ -44,7 +44,12 @@ export type DeskPart = 'menubar' | 'dock' | 'wallpaper'
  * stage did not name. `meta.json` says `captureSurface: "desktop"`, `apps`, `desk` and
  * `windows`: where each named app's windows were, front to back, every time that changed.
  *
- * A stage is performed: `drive`, `mask`, `size`, `window` and `filter` are refused with it.
+ * With `drive` a stage is scripted: each command says which app it acts on (`app` or `pid`;
+ * one that says none acts on the app the last one named), that app is brought forward as a
+ * hand would bring it, and every answer's bounds are in the stage's points. A point given
+ * as `x`, `y` is in the named app's own window, as its outline has it. A drag may end in
+ * another app. A stage's `mask` names the app its element is in; a rectangle is in the
+ * stage's points. `size`, `window` and `filter` are refused with a stage.
  */
 export interface RecordRequest {
   /** A window id from `windows()`. Wins over `pid` and `app`. */
@@ -105,8 +110,30 @@ export interface RecordRequest {
   mask?: MaskTarget[]
 }
 
-/** One thing a take covers: an element (every match of a selector) or a rectangle of the window, in points. */
-export type MaskTarget = { selector: string } | Rect
+/**
+ * One thing a take covers: an element (every match of a selector) or a rectangle of the
+ * window, in points. On a stage an element's mask says which app it is in (unless the stage
+ * is one app), and a rectangle is of the stage.
+ */
+export type MaskTarget = ({ selector: string } & OnStage) | Rect
+
+/** Which app of a stage something is about: its name or bundle id, or its process. */
+export interface OnStage {
+  app?: string
+  pid?: number
+}
+
+/** A stage, where a window would be named: `apps` and/or `pids`, or one `app`/`pid` with `stage`. */
+export interface StageTarget {
+  apps?: string[]
+  pids?: number[]
+  app?: string
+  pid?: number
+  stage?: boolean
+  desk?: DeskPart[]
+  display?: number
+  ground?: string
+}
 
 /** What a take says of one of its masks: the most elements it covered at once. */
 export type MaskReport = ({ selector: string } | { rect: Rect }) & { matched: number }
@@ -175,16 +202,26 @@ export interface StillResult {
   height: number
   /** Pixels per point. */
   scale: number
-  /** The window's frame in global points. */
+  /** The window's frame in global points; a stage's frame, for a stage. */
   frame: Rect
+  /** A stage: the apps on it. `app` is then empty and `window` 0. */
+  apps?: { name: string; id: string }[]
+  /**
+   * A stage: where each app's windows are on it, front to back, in the stage's points. An
+   * outline (`tree`) is in its window's own points: add the window's `x`, `y` to place one.
+   */
+  windows?: (Rect & { id: number; app: string; pid: number })[]
 }
 
 export interface StillEvent extends StillResult {
   event: 'still'
 }
 
-/** What a command acts on: an element by selector, or a point in the window's own points. */
-export type CommandTarget = { selector: string } | { x: number; y: number }
+/**
+ * What a command acts on: an element by selector, or a point in the window's own points. On
+ * a stage it may say which app (`OnStage`); a drag's `to` that names another app ends there.
+ */
+export type CommandTarget = ({ selector: string } | { x: number; y: number }) & OnStage
 
 /**
  * One act of a scripted take. The pointer travels to its target as a hand does, and what
@@ -193,7 +230,10 @@ export type CommandTarget = { selector: string } | { x: number; y: number }
  * A selector is a short path: `button[name='Save']`, `textfield[id='title']`,
  * `toolbar > button[name*='Share']`, `button[name='Delete']:nth(1)`, `*[id='sidebar']`.
  */
-export type Command =
+export type Command = OnStage & Act
+
+/** What a command does. */
+export type Act =
   /** Finds without acting: how many match, and where the first is. */
   | ({ do: 'locate' } & CommandTarget)
   | ({

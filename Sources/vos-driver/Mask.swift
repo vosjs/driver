@@ -23,8 +23,10 @@ final class Masks: @unchecked Sendable {
     /// The selector as it was written, for what the take reports.
     let selector: String?
     let steps: [SelectorStep]
-    /// A rectangle of the window, in its points.
+    /// A rectangle of the window, in its points (on a stage: of the stage, in its points).
     let rect: CGRect?
+    /// On a stage: the app whose window the selector is looked for in.
+    var pid: pid_t? = nil
   }
 
   /// Points added around what is covered: a glyph's overhang, a focus ring.
@@ -56,23 +58,40 @@ final class Masks: @unchecked Sendable {
   private let q = DispatchQueue(label: "vos.driver.mask")
   private var timer: DispatchSourceTimer?
 
-  init(pid: pid_t, windowID: CGWindowID, specs: [Spec]) {
+  /// A stage's masks cover in the stage's points and look in each named app's own window.
+  let stage: Stage?
+
+  init(pid: pid_t, windowID: CGWindowID, specs: [Spec], stage: Stage? = nil) {
     self.pid = pid
     self.windowID = windowID
     self.specs = specs
+    self.stage = stage
     elements = Array(repeating: [], count: specs.count)
     most = Array(repeating: 0, count: specs.count)
   }
 
   /// The masks of a record request: a list of `{ selector }` and `{ x, y, w, h }`.
-  static func parse(_ raw: Any?) throws -> [Spec] {
+  static func parse(_ raw: Any?, stage: Stage? = nil) throws -> [Spec] {
     guard let raw else { return [] }
     guard let list = raw as? [[String: Any]] else {
       throw SelectorError(message: "mask is a list of { selector } or { x, y, w, h }.")
     }
     return try list.map { item in
       if let selector = item["selector"] as? String {
-        return Spec(selector: selector, steps: try parseSelector(selector), rect: nil)
+        var spec = Spec(selector: selector, steps: try parseSelector(selector), rect: nil)
+        if let stage {
+          // An element is some app's: a stage's mask says whose, unless the stage is one app.
+          let named: pid_t?
+          do { named = try stage.process(named: item) } catch let e as InputError {
+            throw SelectorError(message: e.message)
+          }
+          guard let pid = named ?? (stage.pids.count == 1 ? stage.pids.first : nil) else {
+            throw SelectorError(
+              message: "The mask \(selector) says no app: on a stage of several, a mask names the app its element is in (\"app\" or \"pid\").")
+          }
+          spec.pid = pid
+        }
+        return spec
       }
       func n(_ k: String) -> Double? { (item[k] as? NSNumber)?.doubleValue }
       guard let x = n("x"), let y = n("y"), let w = n("w"), let h = n("h"), w > 0, h > 0 else {
@@ -85,13 +104,29 @@ final class Masks: @unchecked Sendable {
   // MARK: reading the app
 
   /// Finds what every selector matches now, then reads where it all is.
+  /// Where the frame's own points begin, in global points: the window's corner, or the stage's.
+  private func origin() -> CGPoint? {
+    if let stage { return stage.rect.origin }
+    return windowFrame(windowID)?.origin
+  }
+
   func search() {
-    guard let frame = windowFrame(windowID) else { return }
-    let needsTree = specs.contains { $0.selector != nil }
     var found: [[AXUIElement]] = Array(repeating: [], count: specs.count)
-    if needsTree, let window = windowElement(pid, frame: frame), let root = readTree(window) {
+    if stage != nil {
+      // Each app's tree is read once, whatever the number of masks that look in it.
+      var roots: [pid_t: Node] = [:]
       for (i, spec) in specs.enumerated() where spec.selector != nil {
-        found[i] = select(spec.steps, in: root).map { $0.element }
+        guard let app = spec.pid else { continue }
+        if roots[app] == nil, let window = appWindow(["pid": Int(app)])?.window { roots[app] = readTree(window) }
+        if let root = roots[app] { found[i] = select(spec.steps, in: root).map { $0.element } }
+      }
+    } else {
+      guard let frame = windowFrame(windowID) else { return }
+      let needsTree = specs.contains { $0.selector != nil }
+      if needsTree, let window = windowElement(pid, frame: frame), let root = readTree(window) {
+        for (i, spec) in specs.enumerated() where spec.selector != nil {
+          found[i] = select(spec.steps, in: root).map { $0.element }
+        }
       }
     }
     locked(lock) {
@@ -103,7 +138,7 @@ final class Masks: @unchecked Sendable {
 
   /// Reads where each covered element is now. Cheap: two attributes an element.
   func read() {
-    guard let frame = windowFrame(windowID) else { return }
+    guard let corner = origin() else { return }
     let held = locked(lock) { elements }
     var next: [CGRect] = []
     for (i, spec) in specs.enumerated() {
@@ -113,7 +148,7 @@ final class Masks: @unchecked Sendable {
       }
       for el in held[i] {
         guard let g = axRect(el), g.width > 0, g.height > 0 else { continue }
-        next.append(g.offsetBy(dx: -frame.minX, dy: -frame.minY))
+        next.append(g.offsetBy(dx: -corner.x, dy: -corner.y))
       }
     }
     let now = CACurrentMediaTime()

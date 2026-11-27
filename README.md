@@ -72,7 +72,7 @@ Several apps in one take: one display with only what you name in its pixels.
 const take = record({ apps: ['Linear', 'Terminal'], out: './take' })
 ```
 
-Every window of those apps is recorded where it is, in its real order. No other app, no wallpaper, no Dock and no menu bar is encoded, and a named window that something else covers on screen is recorded whole. `desk: ['menubar', 'dock', 'wallpaper']` keeps a part of the desk when the desk is the subject.
+Every window of those apps is recorded where it is, in its real order. No other app, no wallpaper, no Dock and no menu bar is encoded, and a named window that something else covers on screen is recorded whole. `desk: ['menubar', 'dock', 'wallpaper']` keeps a part of the desk when the desk is the subject. With `drive: true` it is scripted like a window: each command says which app it acts on, and a drag may end in another one.
 
 ## Script a take
 
@@ -119,7 +119,7 @@ A mask covers what must not show before a frame is encoded, so it is in no file.
 
 ## Status
 
-Early. The helper is ad-hoc signed, not notarised, so macOS records its permissions against the app that launched it (your terminal, editor or agent). No audio, no webcam. A stage is performed: it takes no script and no mask yet. The Intel half records real takes in CI but has not run on a physical Intel Mac.
+Early. The helper is ad-hoc signed, not notarised, so macOS records its permissions against the app that launched it (your terminal, editor or agent). No audio, no webcam. The Intel half records real takes in CI but has not run on a physical Intel Mac.
 
 ## Learn more
 

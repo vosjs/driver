@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { after, before, describe, it } from 'node:test'
-import { DriverError, check, record, windows } from '../dist/index.js'
+import { DriverError, check, record, still, windows } from '../dist/index.js'
 import {
   has,
   killPid,
@@ -24,7 +24,9 @@ import {
   within,
 } from './helpers.mjs'
 
-const granted = onMac ? (await check()).screenRecording : false
+const permissions = onMac ? await check() : { screenRecording: false, accessibility: false }
+const granted = permissions.screenRecording
+const accessible = permissions.accessibility
 const skip = !onMac
   ? 'the helper is macOS only'
   : !granted
@@ -278,10 +280,234 @@ describe('recording a stage', { skip }, () => {
       })
     }
     const pids = [listed.blue.pid]
-    await refused({ pids, mask: [{ x: 0, y: 0, w: 10, h: 10 }] }, 'bad-request', /no mask yet/)
-    await refused({ pids, drive: true }, 'bad-request', /no script yet/)
     await refused({ pids, size: { w: 800, h: 600 } }, 'bad-request', /does not size/)
+    await refused({ pids, window: listed.blue.id }, 'bad-request', /takes no one window/)
     await refused({ pids, desk: ['sky'] }, 'bad-request', /Unknown part of the desk/)
     await refused({ apps: ['no app is called this'] }, 'no-window', /No running app is named/)
+    if (accessible) {
+      // An element is some app's: on a stage of several, a mask says whose.
+      await refused(
+        { pids: [listed.blue.pid, listed.red.pid], mask: [{ selector: "*[id='swatch']" }] },
+        'bad-request',
+        /says no app/,
+      )
+    }
   })
+
+  it(
+    'takes one picture of the stage, and says where each app’s windows are on it',
+    TEST,
+    async () => {
+      const dir = out()
+      const shot = await within(
+        still({ pids: [listed.blue.pid, listed.red.pid], ground: GROUND, out: `${dir}/stage.png` }),
+        WAIT,
+        'still()',
+      )
+      assert.ok(existsSync(shot.out))
+      assert.equal(shot.window, 0)
+      assert.ok(shot.frame.w > listed.blue.frame.w)
+      assert.deepEqual(shot.windows.map((w) => w.id).sort(), [blue.id, red.id].sort())
+      const at = shot.windows.find((w) => w.id === blue.id)
+      assert.equal(at.x, listed.blue.frame.x - shot.frame.x)
+      assert.equal(at.y, listed.blue.frame.y - shot.frame.y)
+      assert.equal(at.pid, listed.blue.pid)
+    },
+  )
+
+  it(
+    'covers what a mask names in an app of the stage, before a frame is encoded',
+    {
+      ...TEST,
+      skip: !accessible && 'Accessibility is not granted to the app that launched these tests',
+    },
+    async () => {
+      // The fixture's swatch is white. Covered, it is the flat colour around it.
+      const swatch = (ready, frame) => {
+        const k = ready.captureWidth / ready.frame.w
+        return [
+          Math.round((frame.x - ready.frame.x + 430) * k),
+          Math.round((frame.y - ready.frame.y + (frame.h - 320) + 28) * k),
+          Math.round(20 * k),
+          Math.round(20 * k),
+        ]
+      }
+      const bare = start({ pids: [listed.blue.pid, listed.red.pid], out: out(), pointer: false })
+      const bareReady = await bare.ready()
+      await sleep(500)
+      const bareStopped = await bare.stop()
+      const [white] = probe(bareStopped.files.recording, 0.2, swatch(bareReady, listed.blue.frame))
+      assert.ok(
+        white.every((c) => c > 200),
+        `the swatch as it is: ${white}`,
+      )
+
+      const t = start({
+        pids: [listed.blue.pid, listed.red.pid],
+        mask: [{ pid: listed.blue.pid, selector: "*[id='swatch']" }],
+        out: out(),
+        pointer: false,
+      })
+      const ready = await t.ready()
+      assert.deepEqual(ready.masks, [1])
+      await sleep(600)
+      const stopped = await t.stop()
+      assert.equal(stopped.masks[0].matched, 1)
+      assert.ok(stopped.maskedFrames > 0)
+      const [covered, other] = probe(
+        stopped.files.recording,
+        0.3,
+        swatch(ready, listed.blue.frame),
+        swatch(ready, listed.red.frame),
+      )
+      assert.ok(isBlue(covered), `the blue window's swatch is covered: ${covered}`)
+      assert.ok(
+        other.every((c) => c > 200),
+        `the red window's is not: nobody named it (${other})`,
+      )
+    },
+  )
 })
+
+// A scripted stage presses the real apps with the machine's own pointer and keyboard, as a
+// scripted take of one window does.
+describe(
+  'scripting a stage',
+  {
+    skip:
+      skip || (!accessible && 'Accessibility is not granted to the app that launched these tests'),
+  },
+  () => {
+    let blue
+    let red
+    const listed = {}
+    const dirs = []
+    const takes = []
+    const opened = []
+    const out = () => {
+      const s = scratch('vos-driver-stage-script-')
+      dirs.push(s)
+      return s.dir
+    }
+
+    before(
+      async () => {
+        blue = await openFixture({ color: BLUE, title: 'stage blue' })
+        red = await openFixture({ color: RED, title: 'stage red' })
+        opened.push(blue, red)
+        await red.place('corner')
+        const find = async (id) => {
+          for (let i = 0; i < 50; i++) {
+            const found = (await within(windows(), WAIT, 'windows()')).find((w) => w.id === id)
+            if (found) return found
+            await sleep(100)
+          }
+          throw new Error(`The window ${id} was never listed.`)
+        }
+        listed.blue = await find(blue.id)
+        listed.red = await find(red.id)
+      },
+      { timeout: 180_000 },
+    )
+
+    after(() => {
+      for (const take of takes) killPid(take.pid)
+      for (const fixture of opened) fixture.close()
+      killStarted()
+      for (const s of dirs) s.remove()
+    })
+
+    it(
+      'each command acts on the app it names, and answers in the stage’s points',
+      TEST,
+      async () => {
+        const take = record({ pids: [listed.blue.pid, listed.red.pid], out: out(), drive: true })
+        takes.push(take)
+        const ready = await within(take.ready, WAIT, 'ready')
+        const send = (command) => within(take.send(command), WAIT, `the answer to ${command.do}`)
+
+        // Nothing says which app yet, and there are two.
+        const unnamed = await send({ do: 'click', selector: "button[id='save']" })
+        assert.equal(unnamed.ok, false)
+        assert.equal(unnamed.code, 'bad-request')
+        assert.match(unnamed.message, /says which it acts on/)
+
+        const pressed = await send({
+          do: 'click',
+          pid: listed.blue.pid,
+          selector: "button[id='save']",
+        })
+        assert.equal(pressed.ok, true, JSON.stringify(pressed))
+        assert.equal(pressed.pressed, true)
+        // The button's bounds, in the stage's points: inside the blue window as the stage has it.
+        const win = {
+          x: listed.blue.frame.x - ready.frame.x,
+          y: listed.blue.frame.y - ready.frame.y,
+          w: listed.blue.frame.w,
+          h: listed.blue.frame.h,
+        }
+        assert.ok(
+          pressed.rect.x >= win.x && pressed.rect.x + pressed.rect.w <= win.x + win.w,
+          JSON.stringify(pressed.rect),
+        )
+        assert.ok(
+          pressed.rect.y >= win.y && pressed.rect.y + pressed.rect.h <= win.y + win.h,
+          JSON.stringify(pressed.rect),
+        )
+        assert.ok(
+          Math.abs(pressed.rect.x - win.x - 16) <= 3,
+          `the button, 16 points in: ${pressed.rect.x - win.x}`,
+        )
+
+        // The other app, by name of its process; then a command that names none stays with it.
+        const typed = await send({
+          do: 'type',
+          pid: listed.red.pid,
+          selector: "textfield[id='title']",
+          text: 'stage',
+        })
+        assert.equal(typed.ok, true, JSON.stringify(typed))
+        const again = await send({ do: 'click', selector: "button[id='save']" })
+        assert.equal(again.ok, true, JSON.stringify(again))
+
+        const stranger = await send({ do: 'click', pid: 1, selector: "button[id='save']" })
+        assert.equal(stranger.ok, false)
+        assert.match(stranger.message, /is not on the stage/)
+
+        const stopped = await within(take.stop(), WAIT, 'stop()')
+        assert.deepEqual(
+          {
+            blue: (await blue.state()).clicks,
+            red: (await red.state()).clicks,
+            typed: (await red.state()).typed,
+          },
+          { blue: 1, red: 1, typed: 5 },
+        )
+
+        // The track is the stage's: the press carries the element's bounds, where the answer said.
+        const track = readJson(stopped.files.cursor)
+        const downs = track.filter((e) => e.type === 'down')
+        assert.ok(downs.length >= 3, `${downs.length} presses`)
+        assert.deepEqual(downs[0].rect, pressed.rect)
+        for (const e of track) {
+          assert.ok(
+            e.x >= 0 && e.x <= ready.frame.w && e.y >= 0 && e.y <= ready.frame.h,
+            JSON.stringify(e),
+          )
+        }
+        const meta = readJson(stopped.files.meta)
+        assert.equal(meta.captureSurface, 'desktop')
+      },
+    )
+
+    it('a performed stage answers a command in words', TEST, async () => {
+      const take = record({ pids: [listed.blue.pid], out: out(), pointer: false })
+      takes.push(take)
+      await within(take.ready, WAIT, 'ready')
+      const answer = await within(take.send({ do: 'now' }), WAIT, 'the answer')
+      assert.equal(answer.ok, false)
+      assert.match(answer.message, /Record it with drive/)
+      await within(take.stop(), WAIT, 'stop()')
+    })
+  },
+)

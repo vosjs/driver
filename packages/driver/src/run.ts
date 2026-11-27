@@ -18,6 +18,7 @@ import {
   type TreeEvent,
   type TreeResult,
   type WindowEvent,
+  type StageTarget,
   type WindowRequest,
 } from './protocol.js'
 
@@ -195,7 +196,9 @@ export async function tree(request: WindowRequest): Promise<TreeResult> {
  * One picture of an app's window, as a take would show it: a PNG at the window's pixel
  * size, with no pointer and nothing of any other app. Needs Screen Recording.
  */
-export async function still(request: WindowRequest & { out: string }): Promise<StillResult> {
+export async function still(
+  request: (WindowRequest | StageTarget) & { out: string },
+): Promise<StillResult> {
   const wire = { ...request, out: resolvePath(request.out) }
   const events = await collect(['still', JSON.stringify(wire)])
   const found = events.find((e): e is StillEvent => e.event === 'still')

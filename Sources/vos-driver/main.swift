@@ -1123,12 +1123,8 @@ func cmdRecord(_ json: String) async {
       ("window", "A stage is every window of the apps it names: it takes no one window."),
       ("size", "A stage does not size a window: its windows are recorded where and as they are."),
       ("filter", "A stage has one scope: the display with everything that was not named kept out."),
-      ("drive", "A stage takes no script yet: it is performed."),
-      ("mask", "A stage takes no mask yet: stage what must not be seen, or leave its app off the stage."),
     ]
     for (field, why) in refused where req[field] != nil && !(req[field] is NSNull) {
-      if field == "drive", req[field] as? Bool == false { continue }
-      if field == "mask", (req[field] as? [Any])?.isEmpty == true { continue }
       fail("bad-request", why)
     }
     for part in (req["desk"] as? [String]) ?? [] where !DESK_PARTS.contains(part) {
@@ -1137,7 +1133,17 @@ func cmdRecord(_ json: String) async {
   }
 
   let maskSpecs: [Masks.Spec]
-  do { maskSpecs = try Masks.parse(req["mask"]) } catch { fail("bad-request", error.localizedDescription) }
+  if staged {
+    // A stage's masks name their apps, so they are read once the stage is known.
+    maskSpecs = []
+    if let list = req["mask"] as? [[String: Any]], list.contains(where: { $0["selector"] != nil }),
+      !AXIsProcessTrusted()
+    {
+      fail("accessibility", ACCESSIBILITY_NEEDED)
+    }
+  } else {
+    do { maskSpecs = try Masks.parse(req["mask"]) } catch { fail("bad-request", error.localizedDescription) }
+  }
   // An element is found through the app's accessibility tree: said before anything is recorded.
   if maskSpecs.contains(where: { $0.selector != nil }), !AXIsProcessTrusted() {
     fail("accessibility", ACCESSIBILITY_NEEDED)
@@ -1169,12 +1175,34 @@ func cmdRecord(_ json: String) async {
     guard let stage = found else {
       fail("no-window", "None of the apps the stage names has a window on screen.")
     }
+    let stageMasks: [Masks.Spec]
+    do { stageMasks = try Masks.parse(req["mask"], stage: stage) } catch {
+      fail("bad-request", error.localizedDescription)
+    }
+    if !stageMasks.isEmpty {
+      progress.at("finding what the take covers")
+      let masks = Masks(pid: 0, windowID: 0, specs: stageMasks, stage: stage)
+      masks.begin()
+      for (i, n) in masks.matched.enumerated() where n == 0 {
+        emit([
+          "event": "notice", "code": "mask-unmatched",
+          "message":
+            "The mask \(stageMasks[i].selector ?? "") matches nothing on the stage now. It is covered from the moment it appears, which can be a frame or two late.",
+        ])
+      }
+      rec.masks = masks
+    }
     do {
       try await rec.startStage(content: content, stage: stage)
     } catch {
       fail("start-failed", error.localizedDescription)
     }
-    await finish(rec: rec, driver: nil, maxSeconds: maxSeconds)
+    // A scripted stage: each command says which app it acts on, and that app is brought
+    // forward when the command comes, as a hand would bring it.
+    let script = drives ? StageDriver(rec: rec, stage: stage) : nil
+    await finish(
+      rec: rec, run: script.map { s in { s.run($0) } },
+      idle: "A performed stage takes no commands. Record it with drive to script it.", maxSeconds: maxSeconds)
   }
 
   progress.at("listing the screen's windows")
@@ -1235,12 +1263,16 @@ func cmdRecord(_ json: String) async {
     fail("start-failed", error.localizedDescription)
   }
 
-  await finish(rec: rec, driver: Driver(rec: rec, pid: pid, windowID: w.windowID), maxSeconds: maxSeconds)
+  let driver = Driver(rec: rec, pid: pid, windowID: w.windowID)
+  await finish(rec: rec, run: { driver.run($0) }, idle: "", maxSeconds: maxSeconds)
 }
 
 /// A take that has started, to its end: it ends on `stop`, a signal, the cap, or the process
-/// that started it going away, and the helper exits with what the take came to.
-func finish(rec: Recorder, driver: Driver?, maxSeconds: Double) async -> Never {
+/// that started it going away, and the helper exits with what the take came to. `run` answers
+/// a script's commands; a take with none says `idle` to one.
+func finish(
+  rec: Recorder, run: (@Sendable ([String: Any]) -> [String: Any])?, idle: String, maxSeconds: Double
+) async -> Never {
   DispatchQueue.global().asyncAfter(deadline: .now() + maxSeconds) { Task { await rec.stop(reason: "cap") } }
 
   let parentHoldsStdin = stdinIsPipe()
@@ -1259,11 +1291,13 @@ func finish(rec: Recorder, driver: Driver?, maxSeconds: Double) async -> Never {
         emit(["event": "result", "ok": false, "code": "bad-request", "message": "A line on stdin is `stop` or one JSON command."])
         continue
       }
-      guard let driver else {
-        emit(["event": "result", "ok": false, "code": "bad-request", "message": "A stage takes no commands yet: it is performed."])
+      guard let run else {
+        var refused: [String: Any] = ["event": "result", "ok": false, "code": "bad-request", "message": idle]
+        if let id = cmd["id"] { refused["id"] = id }
+        emit(refused)
         continue
       }
-      emit(driver.run(cmd))
+      emit(run(cmd))
     }
     // End of input. On a pipe, whatever started this is gone, and a recorder never outlives it.
     if parentHoldsStdin { Task { await rec.stop(reason: "parent-gone") } }
@@ -1398,6 +1432,11 @@ func cmdStill(_ json: String) async {
   else { fail("bad-request", "The still request is not a JSON object.") }
   guard let out = req["out"] as? String, !out.isEmpty else {
     fail("bad-request", "The request names no out file.")
+  }
+  if isStageRequest(req) {
+    answerWithin(BEGIN_SECONDS, "The picture of the stage")
+    await cmdStageStill(req, out: out)
+    return
   }
   answerWithin(BEGIN_SECONDS, "The picture of the window")
   let (content, found) = await awaitedWindow(req)
