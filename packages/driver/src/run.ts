@@ -243,6 +243,9 @@ export interface Recording {
  * at its pixel size, no system pointer in the pixels), `cursor.json` (the pointer's path
  * in the window's own points) and `meta.json`.
  *
+ * With `apps` or `pids` it records a stage instead: one display with only the named apps'
+ * windows in its pixels, and the track in the display's points (see `RecordRequest`).
+ *
  * It returns at once. Await `ready` to know the take has begun, then `stop()` to end the
  * take. The take also ends at `maxSeconds`, when the window's capture stops, and when
  * this process goes away: a recorder never outlives what started it.

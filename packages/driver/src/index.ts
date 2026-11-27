@@ -16,6 +16,7 @@ export type {
   CommandFailureCode,
   CommandResult,
   CommandTarget,
+  DeskPart,
   DriverEvent,
   DriverWindow,
   ErrorEvent,
