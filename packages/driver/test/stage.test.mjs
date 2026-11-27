@@ -559,10 +559,10 @@ describe(
           pressed.rect.y >= win.y && pressed.rect.y + pressed.rect.h <= win.y + win.h,
           JSON.stringify(pressed.rect),
         )
-        assert.ok(
-          Math.abs(pressed.rect.x - win.x - 16) <= 3,
-          `the button, 16 points in: ${pressed.rect.x - win.x}`,
-        )
+        // The fixture stands its button a margin in from the window's left edge; how wide a
+        // margin is the system's (16 points on one macOS, 22 on another).
+        const inset = pressed.rect.x - win.x
+        assert.ok(inset >= 8 && inset <= 32, `the button, a margin in: ${inset}`)
 
         // The other app, by name of its process; then a command that names none stays with it.
         const typed = await send({
