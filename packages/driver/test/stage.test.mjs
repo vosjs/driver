@@ -93,6 +93,14 @@ describe('recording a stage', { skip }, () => {
     throw new Error(`The window ${id} was never listed.`)
   }
   /**
+   * A time the recording holds a frame at: the one asked for, or the take's last frame when
+   * the take is shorter. A take whose frames are copied before they are written (a mask, a
+   * matte) writes few of them on a slow machine, and a short one can end before the time a
+   * test would look at.
+   */
+  const held = (stopped, seconds) => Math.min(seconds, Math.floor(stopped.durationMs) / 1000)
+
+  /**
    * A patch of a window's flat colour, in the recording's pixels: bottom left of its
    * content, clear of the moving bar and the controls.
    */
@@ -360,7 +368,7 @@ describe('recording a stage', { skip }, () => {
     const nothing = [20, 20, 40, 40]
     const [atBlue, atNothing, matteBlue, matteNothing] = probe(
       stopped.files.recording,
-      0.3,
+      held(stopped, 0.3),
       blue,
       nothing,
       inMatte(blue),
@@ -441,7 +449,11 @@ describe('recording a stage', { skip }, () => {
       const bareReady = await bare.ready()
       await sleep(500)
       const bareStopped = await bare.stop()
-      const [white] = probe(bareStopped.files.recording, 0.2, swatch(bareReady, listed.blue.frame))
+      const [white] = probe(
+        bareStopped.files.recording,
+        held(bareStopped, 0.2),
+        swatch(bareReady, listed.blue.frame),
+      )
       assert.ok(
         white.every((c) => c > 200),
         `the swatch as it is: ${white}`,
@@ -461,7 +473,7 @@ describe('recording a stage', { skip }, () => {
       assert.ok(stopped.maskedFrames > 0)
       const [covered, other] = probe(
         stopped.files.recording,
-        0.3,
+        held(stopped, 0.3),
         swatch(ready, listed.blue.frame),
         swatch(ready, listed.red.frame),
       )
