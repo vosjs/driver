@@ -110,8 +110,9 @@ final class Driver: @unchecked Sendable {
         throw InputError(code: "not-in-view", message: "\(selector) is outside the window's visible area.")
       }
       let visible = first.frame.intersection(window)
+      // The rectangle said of it is what is seen of it: the part inside the window.
       return Target(
-        point: CGPoint(x: visible.midX, y: visible.midY), rect: first.frame, count: found.count,
+        point: CGPoint(x: visible.midX, y: visible.midY), rect: visible, count: found.count,
         enabled: first.enabled, name: first.name)
     }
     // A point already found elsewhere (a stage's drag that ends in another app), in global points.

@@ -935,7 +935,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
       lastKeyCount = keys
       if t - lastKeyPing >= 350, NSWorkspace.shared.frontmostApplication?.localizedName == appName {
         lastKeyPing = t
-        if wantFrames, let r = focusedRect(), win.intersects(r) {
+        // What is seen of the element: a terminal's text reaches far above its window, and
+        // the middle of all of it is nowhere on screen.
+        if wantFrames, let whole = focusedRect(), case let r = whole.intersection(win), !r.isEmpty {
           // A field names itself. An element that fills the window (an editor, a canvas) says
           // nothing about WHERE the typing is: there the ping sits at the insertion point.
           let fills = r.width * r.height > 0.5 * win.width * win.height

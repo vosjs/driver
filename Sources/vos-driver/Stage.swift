@@ -400,7 +400,9 @@ extension Recorder {
       lastKeyPing = t
       // The window the typing is in: the frontmost of the app the keyboard goes to.
       let win = stage.windows(in: order).first(where: { $0.pid == front })?.bounds ?? stage.rect
-      if wantFrames, let r = focusedRect(), stage.rect.intersects(r) {
+      // What is seen of the element: a terminal's text reaches far above its window, and the
+      // middle of all of it is nowhere on screen.
+      if wantFrames, let whole = focusedRect(), case let r = whole.intersection(win), !r.isEmpty {
         let fills = r.width * r.height > 0.5 * win.width * win.height
         if fills, let c = caretRect(), stage.rect.intersects(c) {
           push("key", t, CGPoint(x: c.midX, y: c.midY), origin: origin)
